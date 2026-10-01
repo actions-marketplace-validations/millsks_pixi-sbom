@@ -904,7 +904,7 @@ fn doctor_probes_every_upstream_and_fails_when_one_is_unreachable() {
         "conda-forge PyPI mapping",
         "OSV",
         "CISA KEV",
-        "anaconda.org",
+        "conda package index",
         "OpenSSF Scorecard",
     ] {
         assert!(text.contains(upstream), "bare --doctor must probe {upstream}: {text}");
@@ -921,8 +921,8 @@ fn doctor_probes_every_upstream_and_fails_when_one_is_unreachable() {
     .unwrap();
     assert!(text.contains("OSV"), "{text}");
     assert!(
-        !text.contains("anaconda.org"),
-        "--vulnerabilities must not drag in anaconda.org: {text}"
+        !text.contains("conda package index"),
+        "--vulnerabilities must not drag in the conda package index: {text}"
     );
 
     // It needs no lockfile at all.
@@ -933,6 +933,67 @@ fn doctor_probes_every_upstream_and_fails_when_one_is_unreachable() {
         .args(["--doctor", "--fetch-licenses", "--color", "never"])
         .assert()
         .success();
+}
+
+#[test]
+fn doctor_probes_the_archive_hosts_from_the_base_or_the_lockfile() {
+    let dir = workspace("with-pypi");
+    let text = String::from_utf8(
+        pixi_sbom()
+            .current_dir(dir.path())
+            .env("PIXI_SBOM_CACHE_DIR", dir.path().join("cache"))
+            .env("PIXI_SBOM_OFFLINE", "1")
+            .env("COLUMNS", "200")
+            .env("PIXI_SBOM_MAPPING_URL", "https://mirror.invalid/mapping.json")
+            .env("PIXI_SBOM_CONDA_ARCHIVE_URL", "https://mirror.invalid")
+            .env("PIXI_SBOM_WHEEL_ARCHIVE_URL", "https://mirror.invalid/pypi")
+            .args(["--doctor", "--color", "never"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+
+    // A configured base is what the archives are probed at, and it is named as the source.
+    for (upstream, variable) in [
+        ("conda package archives", "PIXI_SBOM_CONDA_ARCHIVE_URL"),
+        ("PyPI wheel archives", "PIXI_SBOM_WHEEL_ARCHIVE_URL"),
+        ("conda-forge PyPI mapping", "PIXI_SBOM_MAPPING_URL"),
+    ] {
+        assert!(text.contains(upstream), "{upstream} missing: {text}");
+        assert!(
+            text.contains(variable),
+            "{variable} should be named as the source: {text}"
+        );
+    }
+
+    // Without a base the archives are still probed, from the hosts the lockfile itself names.
+    let bare = String::from_utf8(
+        pixi_sbom()
+            .current_dir(dir.path())
+            .env("PIXI_SBOM_CACHE_DIR", dir.path().join("cache"))
+            .env("PIXI_SBOM_OFFLINE", "1")
+            .env("COLUMNS", "200")
+            .args(["--doctor", "--color", "never"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert!(bare.contains("conda package archives"), "{bare}");
+    assert!(bare.contains("PyPI wheel archives"), "{bare}");
+    assert!(
+        bare.contains("(pixi.lock)"),
+        "the archive hosts should be attributed to the lockfile: {bare}"
+    );
+    assert!(
+        bare.contains("https://conda.anaconda.org"),
+        "the fixture's own conda host should be the one probed: {bare}"
+    );
 }
 
 #[test]
