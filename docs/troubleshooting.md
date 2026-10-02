@@ -88,6 +88,40 @@ Error: pixi_sbom::http::ca_bundle
         a DER file must be converted first (openssl x509 -inform der -in ca.der -out ca.pem)
 ```
 
+### A channel that needs credentials
+
+A private channel or index answers 401, usually on `--fetch-licenses`, which reads each archive
+from the host the lockfile names. pixi-sbom reads the credentials the conda ecosystem already
+keeps, in the order `rattler` consults them:
+
+| Source | |
+|---|---|
+| `RATTLER_AUTH_FILE` | a credentials file named by the environment |
+| `~/.rattler/credentials.json` | where `pixi auth login` writes |
+| `~/.netrc` | `NETRC` overrides the path; `_netrc` on Windows |
+
+So a host already set up for pixi needs nothing further:
+
+```sh
+pixi auth login artifactory.corp --token "$TOKEN"
+pixi sbom --fetch-licenses
+```
+
+Entries are matched by exact host first, then `*.domain` walking up the labels, so
+`*.corp.example` covers `artifactory.corp.example`. A `.netrc` `default` entry applies to any host
+with no better match.
+
+Bearer tokens, basic auth and conda tokens are all used; a conda token goes in the path as
+`/t/<token>/` the way conda does it. Credentials never appear in a log line, a cache key or a
+produced document.
+
+**The platform keyring is not read.** pixi can keep credentials there, and pixi-sbom cannot reach
+them without a platform dependency that would not help a CI runner anyway. Export the entry into a
+file and point `RATTLER_AUTH_FILE` at it.
+
+**S3 and OAuth credentials are recognised but not used.** A host configured with either is
+requested unauthenticated, with a warning naming the host, rather than failing silently.
+
 ### A blocked host
 
 `pixi sbom --doctor` on its own probes every fixed upstream and names the ones that did not answer, so start
@@ -114,6 +148,26 @@ with no network at all. That mapping is what an air-gapped run of `--vulnerabili
 cannot do without.
 
 ## 3. Read the requests
+
+`-v` turns on the per-request lines; `-vv` adds the detail that matters when a run cannot be reproduced on
+another machine:
+
+| Level | |
+|---|---|
+| `-v` (debug) | every request and its outcome, which credentials file was loaded, cache hits and misses |
+| `-vv` (trace) | per-request credential attribution, the hosts credentials exist for, and **response headers** |
+
+Response headers are the thing to reach for when a request fails and the status does not say why. A proxy or a
+gateway that strips or rewrites `Authorization` is invisible from a status code and obvious from the headers.
+Values that carry a credential are masked by length rather than printed, so a log is safe to paste:
+
+```
+TRACE pixi_sbom::http: response headers url="https://artifactory.corp/..."
+      headers="server: Artifactory; set-cookie: <32 chars>; x-api-key: <15 chars>; content-length: 11"
+```
+
+`Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`, `X-JFrog-Art-Api` and `X-Api-Key` are masked
+everywhere they appear. A conda token changes the URL that is requested, and the original is what gets logged.
 
 ```sh
 RUST_LOG=pixi_sbom::http=debug,pixi_sbom=info pixi sbom --vulnerabilities osv

@@ -151,6 +151,15 @@ pub fn init_tls(roots: &TlsRoots) -> Result<(), CaBundleError> {
 
 /// Build the agent: the trust anchors this run resolved, proxies from the environment (and,
 /// on Windows, from the system settings), one timeout.
+/// Apply whatever credentials this machine holds for a URL.
+///
+/// Returns the URL to request, which a conda token rewrites, and the header to send. The caller
+/// keeps the original URL for logging: a rewritten one carries the token in its path.
+fn authorized(url: &str) -> (String, Option<String>) {
+    let prepared = crate::auth::prepare(url);
+    (prepared.url, prepared.authorization)
+}
+
 fn agent() -> ureq::Agent {
     let roots = ROOTS.get().cloned().unwrap_or(ureq::tls::RootCerts::PlatformVerifier);
     let tls = ureq::tls::TlsConfig::builder().root_certs(roots).build();
@@ -330,6 +339,51 @@ pub fn error_chain(err: &dyn std::error::Error) -> String {
 }
 
 /// Log a request about to go out. Debug, because a normal run should be quiet.
+/// Header names whose values never reach a log line, whatever the level.
+const SECRET_HEADERS: &[&str] = &[
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+    "x-jfrog-art-api",
+    "x-api-key",
+];
+
+/// One line of headers, with anything that carries a credential masked.
+///
+/// A corporate proxy or a gateway that strips or rewrites `Authorization` is invisible from a
+/// status code, and this is what shows it. The values are masked rather than omitted so the
+/// presence and length of a header are still visible.
+fn headers_for_logging<'a>(headers: impl Iterator<Item = (&'a str, &'a str)>) -> String {
+    headers
+        .map(|(name, value)| {
+            if SECRET_HEADERS.contains(&name.to_ascii_lowercase().as_str()) {
+                format!("{name}: <{} chars>", value.len())
+            } else {
+                format!("{name}: {value}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// The response's headers at `trace`, masked. Separate from `finished` so the common path does
+/// not pay for the formatting.
+fn trace_response(url: &str, response: &ureq::http::Response<ureq::Body>) {
+    if tracing::enabled!(tracing::Level::TRACE) {
+        tracing::trace!(
+            url,
+            headers = headers_for_logging(
+                response
+                    .headers()
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.to_str().unwrap_or("<not text>")))
+            ),
+            "response headers"
+        );
+    }
+}
+
 fn starting(method: &str, url: &str, detail: &str) {
     tracing::debug!(
         method,
@@ -338,6 +392,16 @@ fn starting(method: &str, url: &str, detail: &str) {
         proxy = proxy_for_logging().as_deref().unwrap_or("none"),
         "requesting"
     );
+    if tracing::enabled!(tracing::Level::TRACE) {
+        let prepared = crate::auth::prepare(url);
+        tracing::trace!(
+            url,
+            // Says whether a credential was attached and where it came from, never its value.
+            credentials = crate::auth::describe(url),
+            rewritten = (prepared.url != url).then_some(true),
+            "request credentials"
+        );
+    }
 }
 
 /// Log how a request ended, with the time it took.
@@ -363,6 +427,15 @@ fn failed(method: &str, url: &str, started: Instant, err: ureq::Error) -> Box<ur
         cause = error_chain(&err),
         "request failed"
     );
+    // A rejected credential and a missing one are the same status code and want opposite fixes,
+    // so the one case worth a louder line than the rest is the one nobody can diagnose.
+    if let ureq::Error::StatusCode(401 | 403) = err {
+        tracing::warn!(
+            url,
+            credentials = crate::auth::describe(url),
+            "the host refused the request; see the credentials section of the troubleshooting guide"
+        );
+    }
     Box::new(err)
 }
 
@@ -373,10 +446,13 @@ pub fn get_text(url: &str, limit: u64) -> Result<String, Box<ureq::Error>> {
     }
     let started = Instant::now();
     starting("GET", url, "");
-    let mut response = agent()
-        .get(url)
-        .call()
-        .map_err(|err| failed("GET", url, started, err))?;
+    let (target, authorization) = authorized(url);
+    let mut request = agent().get(&target);
+    if let Some(value) = &authorization {
+        request = request.header("Authorization", value);
+    }
+    let mut response = request.call().map_err(|err| failed("GET", url, started, err))?;
+    trace_response(url, &response);
     let status = response.status().as_u16();
     let body = response
         .body_mut()
@@ -396,11 +472,12 @@ pub fn post_json(url: &str, body: &str, limit: u64) -> Result<String, Box<ureq::
     }
     let started = Instant::now();
     starting("POST", url, &format!("{} byte body", body.len()));
-    let mut response = agent()
-        .post(url)
-        .header("Content-Type", "application/json")
-        .send(body)
-        .map_err(|err| failed("POST", url, started, err))?;
+    let (target, authorization) = authorized(url);
+    let mut request = agent().post(&target).header("Content-Type", "application/json");
+    if let Some(value) = &authorization {
+        request = request.header("Authorization", value);
+    }
+    let mut response = request.send(body).map_err(|err| failed("POST", url, started, err))?;
     let status = response.status().as_u16();
     let text = response
         .body_mut()
@@ -419,10 +496,12 @@ pub fn get_bytes(url: &str, limit: u64) -> Result<Vec<u8>, Box<ureq::Error>> {
     }
     let started = Instant::now();
     starting("GET", url, "whole body");
-    let mut response = agent()
-        .get(url)
-        .call()
-        .map_err(|err| failed("GET", url, started, err))?;
+    let (target, authorization) = authorized(url);
+    let mut request = agent().get(&target);
+    if let Some(value) = &authorization {
+        request = request.header("Authorization", value);
+    }
+    let mut response = request.call().map_err(|err| failed("GET", url, started, err))?;
     let status = response.status().as_u16();
     let bytes = response
         .body_mut()
@@ -455,7 +534,12 @@ pub fn get_tail(url: &str, count: u64) -> Result<(u64, Vec<u8>), Box<ureq::Error
     }
     let started = Instant::now();
     starting("GET", url, &format!("range bytes=-{count}"));
-    let mut response = match agent().get(url).header("Range", &format!("bytes=-{count}")).call() {
+    let (target, authorization) = authorized(url);
+    let mut tail = agent().get(&target).header("Range", &format!("bytes=-{count}"));
+    if let Some(value) = &authorization {
+        tail = tail.header("Authorization", value);
+    }
+    let mut response = match tail.call() {
         Ok(response) => response,
         // Some CDNs answer 416 to a suffix longer than the file instead of sending it whole
         // (RFC 9110 allows either). Learn the size and ask for an exact range instead.
@@ -500,10 +584,12 @@ pub fn get_tail(url: &str, count: u64) -> Result<(u64, Vec<u8>), Box<ureq::Error
 fn content_length(url: &str) -> Result<u64, Box<ureq::Error>> {
     let started = Instant::now();
     starting("HEAD", url, "");
-    let response = agent()
-        .head(url)
-        .call()
-        .map_err(|err| failed("HEAD", url, started, err))?;
+    let (target, authorization) = authorized(url);
+    let mut head = agent().head(&target);
+    if let Some(value) = &authorization {
+        head = head.header("Authorization", value);
+    }
+    let response = head.call().map_err(|err| failed("HEAD", url, started, err))?;
     finished("HEAD", url, response.status().as_u16(), 0, started);
     response
         .headers()
@@ -520,11 +606,12 @@ pub fn get_range(url: &str, start: u64, end: u64) -> Result<Vec<u8>, Box<ureq::E
     }
     let started_at = Instant::now();
     starting("GET", url, &format!("range bytes={start}-{end}"));
-    let mut response = agent()
-        .get(url)
-        .header("Range", &format!("bytes={start}-{end}"))
-        .call()
-        .map_err(|err| failed("GET", url, started_at, err))?;
+    let (target, authorization) = authorized(url);
+    let mut ranged = agent().get(&target).header("Range", &format!("bytes={start}-{end}"));
+    if let Some(value) = &authorization {
+        ranged = ranged.header("Authorization", value);
+    }
+    let mut response = ranged.call().map_err(|err| failed("GET", url, started_at, err))?;
     let status = response.status().as_u16();
     if response.status() != 206 {
         return Err(other("server does not support HTTP range requests"));
@@ -547,6 +634,28 @@ pub fn get_range(url: &str, start: u64, end: u64) -> Result<Vec<u8>, Box<ureq::E
 
 #[cfg(test)]
 mod tests {
+    /// A log line is the thing people paste into an issue, so nothing in it may be a credential.
+    #[test]
+    fn credential_carrying_headers_are_masked_by_length() {
+        let line = headers_for_logging(
+            [
+                ("content-type", "application/json"),
+                ("Authorization", "Bearer supersecret"),
+                ("Set-Cookie", "session=alsosecret; Path=/"),
+                ("X-JFrog-Art-Api", "an-api-key"),
+            ]
+            .into_iter(),
+        );
+        assert!(line.contains("content-type: application/json"), "{line}");
+        for secret in ["supersecret", "alsosecret", "an-api-key"] {
+            assert!(!line.contains(secret), "{secret} leaked into {line}");
+        }
+        // Masked by length rather than dropped: that a header was present is itself the signal
+        // when a proxy strips one.
+        assert!(line.contains("Authorization: <18 chars>"), "{line}");
+        assert!(line.contains("X-JFrog-Art-Api: <10 chars>"), "{line}");
+    }
+
     use super::*;
 
     /// A self-signed certificate, generated once for the tests; any valid PEM would do, the
