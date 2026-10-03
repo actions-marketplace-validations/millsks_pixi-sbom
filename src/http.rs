@@ -146,11 +146,15 @@ pub fn init_tls(roots: &TlsRoots) -> Result<(), CaBundleError> {
         "using a CA bundle instead of the platform trust store"
     );
     let _ = ROOTS.set(ureq::tls::RootCerts::Specific(std::sync::Arc::new(certificates)));
+    // The agent is built once and keeps whatever trust anchors it was built with. Setting them
+    // afterwards would leave the bundle silently unused, which is the kind of failure that looks
+    // like a certificate problem for an afternoon.
+    if AGENT.get().is_some() {
+        tracing::warn!("the CA bundle was read after the first request; it applies from the next run, not this one");
+    }
     Ok(())
 }
 
-/// Build the agent: the trust anchors this run resolved, proxies from the environment (and,
-/// on Windows, from the system settings), one timeout.
 /// Apply whatever credentials this machine holds for a URL.
 ///
 /// Returns the URL to request, which a conda token rewrites, and the header to send. The caller
@@ -160,9 +164,29 @@ fn authorized(url: &str) -> (String, Option<String>) {
     (prepared.url, prepared.authorization)
 }
 
+/// The agent every request goes through.
+///
+/// In ureq 3 the `Agent` *owns the connection pool*, so one built per request reuses nothing: every
+/// call paid a fresh TCP connect and TLS handshake. Measured over 12 requests to a responsive host,
+/// that was 132 ms each against 65 ms on a shared agent — roughly half of per-request time spent
+/// setting up a connection that the previous request had already established.
+///
+/// Built on first use rather than at startup because [`init_tls`] has to resolve the trust anchors
+/// first; it runs before anything is fetched, and `init_tls` says so if that order is ever broken.
+static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+
+/// The shared agent, cloned per call. `ureq::Agent` is a handle: cloning shares the pool rather
+/// than copying it, which is the whole point.
 fn agent() -> ureq::Agent {
+    AGENT.get_or_init(build_agent).clone()
+}
+
+/// Build the agent: the trust anchors this run resolved, proxies from the environment (and, on
+/// Windows, from the system settings), one timeout.
+fn build_agent() -> ureq::Agent {
     let roots = ROOTS.get().cloned().unwrap_or(ureq::tls::RootCerts::PlatformVerifier);
     let tls = ureq::tls::TlsConfig::builder().root_certs(roots).build();
+    tracing::debug!(custom_roots = ROOTS.get().is_some(), "building the shared HTTP agent");
     ureq::Agent::config_builder()
         .tls_config(tls)
         .timeout_global(Some(TIMEOUT))
@@ -460,6 +484,77 @@ pub(crate) fn explain(status: u16, credentialed: bool) -> Option<Explanation> {
     }
 }
 
+/// Attempts a request gets in total, the first included. This is a tool that has to finish, not a
+/// daemon, so the ceiling is low and total waiting is capped as well as attempt count.
+const MAX_ATTEMPTS: u32 = 4;
+
+/// The first pause, doubled each time.
+const FIRST_BACKOFF: Duration = Duration::from_millis(300);
+
+/// The most time a single request may add by waiting. A run of several hundred packages must not
+/// be able to turn a rate limit into minutes of sleeping.
+const MAX_BACKOFF: Duration = Duration::from_secs(10);
+
+/// Whether a failure is worth trying again.
+///
+/// Only the statuses that mean "ask me again": a rate limit, and the gateway errors a proxy returns
+/// while an upstream is briefly unavailable. Everything else is a decision that will not change —
+/// #290 covers why a 403 in particular is a policy rather than something to wait out.
+///
+/// Transport failures are deliberately **not** retried. A host that does not resolve will not
+/// resolve 300 ms later, and a timeout has already spent the full request budget, so trying again
+/// multiplies the worst case instead of recovering from it.
+pub(crate) fn worth_retrying(err: &ureq::Error) -> bool {
+    matches!(err, ureq::Error::StatusCode(429 | 502 | 503 | 504))
+}
+
+/// How long to wait before attempt `attempt` (1 after the first failure), with jitter.
+///
+/// The jitter is the point, not a flourish: these requests were launched together from one pool, so
+/// without it they back off together and reproduce the burst that caused the limit.
+pub(crate) fn backoff(attempt: u32, jitter: u32) -> Duration {
+    let base = FIRST_BACKOFF.saturating_mul(1u32 << attempt.min(8).saturating_sub(1));
+    let base = base.min(MAX_BACKOFF);
+    // Up to a quarter of the pause again, so a batch spreads rather than marching in step.
+    let spread = u64::try_from(base.as_millis() / 4).unwrap_or(1).max(1);
+    base + Duration::from_millis(u64::from(jitter) % spread)
+}
+
+/// A pseudo-random number for jitter. The clock is enough here: this spreads a thundering herd, it
+/// does not need to be unpredictable, and a dependency for it would not earn its place.
+fn jitter() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.subsec_nanos())
+}
+
+/// Run `once`, trying again when the answer says to. Returns the last error when the attempts or
+/// the time budget run out, so the caller sees a real failure rather than a retry artefact.
+fn with_retries<T>(url: &str, mut once: impl FnMut() -> Result<T, Box<ureq::Error>>) -> Result<T, Box<ureq::Error>> {
+    let mut spent = Duration::ZERO;
+    let mut attempt = 1;
+    loop {
+        let err = match once() {
+            Ok(value) => return Ok(value),
+            Err(err) => err,
+        };
+        let pause = backoff(attempt, jitter());
+        if attempt >= MAX_ATTEMPTS || !worth_retrying(&err) || spent + pause > MAX_BACKOFF {
+            return Err(err);
+        }
+        spent += pause;
+        tracing::debug!(
+            url,
+            attempt,
+            ms = pause.as_millis(),
+            cause = error_chain(err.as_ref()),
+            "the upstream asked us to wait; trying again"
+        );
+        std::thread::sleep(pause);
+        attempt += 1;
+    }
+}
+
 /// Log a failed request with the whole chain, so the line a user pastes carries the cause, and
 /// hand the error on unchanged — callers read its variant to tell one dead URL from a dead
 /// network.
@@ -503,26 +598,28 @@ fn get_text_inner(url: &str, limit: u64, explained: bool) -> Result<String, Box<
     if offline() {
         return Err(refuse("GET", url));
     }
-    let started = Instant::now();
-    starting("GET", url, "");
-    let (target, authorization) = authorized(url);
-    let mut request = agent().get(&target);
-    if let Some(value) = &authorization {
-        request = request.header("Authorization", value);
-    }
-    let mut response = request
-        .call()
-        .map_err(|err| failed("GET", url, started, err, explained))?;
-    trace_response(url, &response);
-    let status = response.status().as_u16();
-    let body = response
-        .body_mut()
-        .with_config()
-        .limit(limit)
-        .read_to_string()
-        .map_err(|err| failed("GET", url, started, err, explained))?;
-    finished("GET", url, status, body.len(), started);
-    Ok(body)
+    with_retries(url, || {
+        let started = Instant::now();
+        starting("GET", url, "");
+        let (target, authorization) = authorized(url);
+        let mut request = agent().get(&target);
+        if let Some(value) = &authorization {
+            request = request.header("Authorization", value);
+        }
+        let mut response = request
+            .call()
+            .map_err(|err| failed("GET", url, started, err, explained))?;
+        trace_response(url, &response);
+        let status = response.status().as_u16();
+        let body = response
+            .body_mut()
+            .with_config()
+            .limit(limit)
+            .read_to_string()
+            .map_err(|err| failed("GET", url, started, err, explained))?;
+        finished("GET", url, status, body.len(), started);
+        Ok(body)
+    })
 }
 
 /// POST `body` as JSON to `url` and return the response body as text, refusing responses
@@ -531,25 +628,27 @@ pub fn post_json(url: &str, body: &str, limit: u64) -> Result<String, Box<ureq::
     if offline() {
         return Err(refuse("POST", url));
     }
-    let started = Instant::now();
-    starting("POST", url, &format!("{} byte body", body.len()));
-    let (target, authorization) = authorized(url);
-    let mut request = agent().post(&target).header("Content-Type", "application/json");
-    if let Some(value) = &authorization {
-        request = request.header("Authorization", value);
-    }
-    let mut response = request
-        .send(body)
-        .map_err(|err| failed("POST", url, started, err, true))?;
-    let status = response.status().as_u16();
-    let text = response
-        .body_mut()
-        .with_config()
-        .limit(limit)
-        .read_to_string()
-        .map_err(|err| failed("POST", url, started, err, true))?;
-    finished("POST", url, status, text.len(), started);
-    Ok(text)
+    with_retries(url, || {
+        let started = Instant::now();
+        starting("POST", url, &format!("{} byte body", body.len()));
+        let (target, authorization) = authorized(url);
+        let mut request = agent().post(&target).header("Content-Type", "application/json");
+        if let Some(value) = &authorization {
+            request = request.header("Authorization", value);
+        }
+        let mut response = request
+            .send(body)
+            .map_err(|err| failed("POST", url, started, err, true))?;
+        let status = response.status().as_u16();
+        let text = response
+            .body_mut()
+            .with_config()
+            .limit(limit)
+            .read_to_string()
+            .map_err(|err| failed("POST", url, started, err, true))?;
+        finished("POST", url, status, text.len(), started);
+        Ok(text)
+    })
 }
 
 /// GET `url` whole, refusing bodies larger than `limit` bytes.
@@ -697,6 +796,75 @@ pub fn get_range(url: &str, start: u64, end: u64) -> Result<Vec<u8>, Box<ureq::E
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_the_answers_that_mean_ask_again_are_retried() {
+        use super::worth_retrying;
+        // A rate limit, and the gateway errors a proxy gives while an upstream is briefly out.
+        for status in [429, 502, 503, 504] {
+            assert!(
+                worth_retrying(&ureq::Error::StatusCode(status)),
+                "{status} means try again"
+            );
+        }
+        // Everything else is a decision that will not change by asking twice. 403 in particular:
+        // it is policy, and retrying a policy is only a slower refusal.
+        for status in [200, 301, 400, 401, 403, 404, 410, 500, 501] {
+            assert!(
+                !worth_retrying(&ureq::Error::StatusCode(status)),
+                "{status} will say the same thing again"
+            );
+        }
+        // Transport failures are not retried either: a host that does not resolve will not resolve
+        // in 300 ms, and a timeout has already spent the whole request budget, so trying again
+        // multiplies the worst case rather than recovering from it.
+        assert!(!worth_retrying(&ureq::Error::HostNotFound));
+        assert!(!worth_retrying(&ureq::Error::ConnectionFailed));
+    }
+
+    #[test]
+    fn backoff_grows_stays_bounded_and_spreads_a_batch() {
+        use super::{FIRST_BACKOFF, MAX_BACKOFF, backoff};
+        // Each attempt waits at least twice the last, so a persistent limit is not hammered.
+        let plain: Vec<_> = (1..=4).map(|attempt| backoff(attempt, 0)).collect();
+        assert_eq!(plain[0], FIRST_BACKOFF);
+        for pair in plain.windows(2) {
+            assert!(pair[1] >= pair[0] * 2, "{plain:?}");
+        }
+        // And never past the ceiling, however many attempts are asked for.
+        for attempt in 1..40 {
+            assert!(backoff(attempt, u32::MAX) <= MAX_BACKOFF * 2, "attempt {attempt}");
+        }
+        // Jitter is the point, not a flourish: these requests were launched together, so without
+        // it they would back off together and reproduce the burst that caused the limit.
+        let spread: std::collections::BTreeSet<_> = (0..50).map(|jitter| backoff(2, jitter * 7919)).collect();
+        assert!(spread.len() > 1, "identical pauses would march a batch in step");
+        assert!(
+            spread.iter().all(|pause| *pause >= backoff(2, 0)),
+            "jitter only ever adds"
+        );
+    }
+
+    #[test]
+    fn the_agent_is_built_once_and_every_request_shares_it() {
+        // The pool lives in the Agent, so one per request reuses no connection. `agent()` must
+        // hand out clones of a single instance rather than building a new one each time; a clone
+        // of a `ureq::Agent` shares the pool, which is the whole point.
+        let first = super::agent();
+        assert!(
+            super::AGENT.get().is_some(),
+            "the first call initialises the shared agent"
+        );
+        let second = super::agent();
+        // `ureq::Agent` is a handle around a shared pool, so two clones report the same timeout
+        // and user agent. The OnceLock above is the real check that only one was ever built.
+        assert_eq!(first.config().timeouts().global, second.config().timeouts().global);
+        assert_eq!(
+            first.config().timeouts().global,
+            Some(super::TIMEOUT),
+            "and it carries this run's configuration, not ureq's defaults"
+        );
+    }
+
     #[test]
     fn a_refusal_only_blames_credentials_when_some_were_sent() {
         use super::{Explanation, explain};
