@@ -87,7 +87,27 @@ fn main() -> Result<()> {
     describe_input(&args, &lockfile, &cwd);
     tracing::debug!(?args, "effective arguments");
     // How many things may happen at once, before anything starts happening.
-    let (limits, unusable_concurrency) = concurrency::Limits::from_env();
+    // Precedence: the command line, then the environment, then a configuration file, then the
+    // default. The variable beating the file is deliberate — a file is checked into a repository or
+    // sits on a machine, while the variable is set by whoever is running *this* invocation, and
+    // someone exporting it to get through a slow afternoon should not be overruled by a file they
+    // did not write.
+    let on_command_line = matches.value_source("concurrency") == Some(clap::parser::ValueSource::CommandLine);
+    let from_variable = std::env::var(concurrency::CONCURRENCY_ENV).ok();
+    let (requested, chosen) = match (on_command_line, from_variable.as_deref(), args.concurrency) {
+        (true, _, requested) => (requested, concurrency::Source::Flag),
+        (false, Some(value), _) => (value.trim().parse::<usize>().ok(), concurrency::Source::Variable),
+        // Not on the command line and no variable, so anything here came from a file.
+        (false, None, Some(requested)) => (Some(requested), concurrency::Source::File),
+        (false, None, None) => (None, concurrency::Source::Machine),
+    };
+    let unusable_concurrency = match (chosen, from_variable.as_deref()) {
+        (concurrency::Source::Variable, Some(value)) if requested.is_none_or(|n| n == 0) => Some(value.to_string()),
+        _ => None,
+    };
+    let requested_concurrency = requested.unwrap_or(0);
+    let cores = std::thread::available_parallelism().map_or(1, |cores| cores.get());
+    let limits = concurrency::Limits::with(requested, chosen, cores);
     concurrency::init(limits);
     if let Some(value) = unusable_concurrency {
         tracing::warn!(
@@ -95,8 +115,13 @@ fn main() -> Result<()> {
             value,
             network = limits.network,
             cpu = limits.cpu,
-            "not a positive number of jobs; using the machine's own limits"
+            "not a positive number of requests; using the default"
         );
+    }
+    // A number far past what any upstream tolerates is honoured but not silently: the operator may
+    // have their own mirror, and may equally have typed an extra zero.
+    if let Some(concern) = concurrency::Limits::concern(requested_concurrency) {
+        tracing::warn!(variable = concurrency::CONCURRENCY_ENV, "{concern}");
     }
     // What the caches may do this run, before anything reads one.
     cache::init(cache::Policy::new(
@@ -132,7 +157,14 @@ fn main() -> Result<()> {
     if args.doctor {
         let palette = style::Palette::new(args.color.enabled());
         let mut stdout = std::io::stdout().lock();
-        let healthy = run_doctor(&network, &config_layers, &palette, &mut stdout)? && unusable_bundle.is_none();
+        let healthy = run_doctor(
+            &network,
+            &config_layers,
+            limits,
+            args.conda_index_kind,
+            &palette,
+            &mut stdout,
+        )? && unusable_bundle.is_none();
         stdout.flush().into_diagnostic()?;
         std::process::exit(if healthy { 0 } else { DOCTOR_EXIT_CODE });
     }
@@ -318,6 +350,10 @@ fn main() -> Result<()> {
             );
             tracing::debug!(?excluded, ?orphans, "filtered package names");
         }
+        // Now that the package count is final, do not size the request pool past it: threads
+        // beyond the work can only park, and a machine-wide setting carried into a small
+        // workspace is how a pool gets asked for that the system may refuse.
+        concurrency::limit_to_work(sbom.packages.len());
         if let Some(mapping) = &pypi_mapping {
             let enriched = mapping::enrich(&mut sbom, mapping);
             tracing::info!(enriched, "added PyPI purls to conda packages");
@@ -1136,6 +1172,8 @@ const DOCTOR_EXIT_CODE: i32 = 1;
 fn run_doctor(
     network: &http::Configuration,
     config_layers: &[config::Loaded],
+    limits: concurrency::Limits,
+    conda_index_kind: cli::CondaIndexKind,
     palette: &style::Palette,
     out: &mut dyn Write,
 ) -> Result<bool> {
@@ -1154,6 +1192,29 @@ fn run_doctor(
             network.no_proxy.as_deref().unwrap_or("none"),
             network.tls_roots,
             network.timeout.as_secs()
+        ),
+    )?;
+    write(
+        out,
+        format!(
+            // Two settings that decide how a run behaves and were nowhere in this report. The
+            // source matters as much as the number: with four places concurrency can come from,
+            // "which one won?" is otherwise only answerable with -v.
+            "  requests   {} at once ({})\n  index      {} ({})",
+            limits.network,
+            limits.source.name(),
+            match conda_index_kind {
+                cli::CondaIndexKind::Anaconda => "anaconda.org's package API",
+                cli::CondaIndexKind::Prefix => "prefix.dev's GraphQL API",
+            },
+            if config_layers
+                .iter()
+                .any(|layer| layer.config.conda_index_kind.is_some())
+            {
+                "a configuration file"
+            } else {
+                "the default"
+            },
         ),
     )?;
     write(
