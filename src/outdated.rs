@@ -830,14 +830,19 @@ impl Lookup<'_> {
 
         // One request per ten packages instead of one each, before the ordinary pass reads them
         // back out of the cache.
-        self.warm_in_batches(&jobs, fetch, now);
+        let prefetched = self.warm_in_batches(&jobs, fetch, now);
 
         let bar = progress.bar("releases", jobs.len());
         let documents = crate::concurrency::map(
             &jobs,
             Some(&bar),
             |job| job.display_name.clone(),
-            |job| self.document(job, fetch, now),
+            |job| match prefetched.get(&job.index) {
+                // Already asked for, in a batch, moments ago. Going back to disk for it would be
+                // slower and would report the answer as cached when it was fetched this run.
+                Some(document) => (Some(document.clone()), false),
+                None => self.document(job, fetch, now),
+            },
         );
         bar.finish();
 
@@ -985,52 +990,77 @@ impl Lookup<'_> {
     /// through [`Self::document`] afterwards and finds its answer already there; if a batch fails,
     /// is rejected, or comes back missing an alias, nothing is lost and that package is simply
     /// fetched on its own as before.
-    fn warm_in_batches(&self, jobs: &[Job], fetch: Fetch<'_>, now: SystemTime) {
+    /// Returns what it managed to answer, keyed by the package's position in the SBOM.
+    ///
+    /// The answers are handed back rather than left for [`Self::document`] to find on disk. Reading
+    /// them back would count a fetch this run just made as a cache hit, and the cache counters are
+    /// how anyone tells a cold run from a warm one — including the `--timings` detail.
+    fn warm_in_batches(&self, jobs: &[Job], fetch: Fetch<'_>, now: SystemTime) -> BTreeMap<usize, String> {
         if self.kind != crate::cli::CondaIndexKind::Prefix || http::offline() {
-            return;
+            return BTreeMap::new();
         }
         let wanted: Vec<&Job> = jobs
             .iter()
             .filter(|job| job.body.is_some() && job.follow_up.is_some() && !Self::cache_is_usable(job, now))
             .collect();
         if wanted.len() < 2 {
-            return;
+            return BTreeMap::new();
         }
-        // The batches run concurrently, like the requests they replace. Measured the other way
-        // round first: six sequential batches took 3.3 s against 1.8 s for sixty-five requests ten
-        // at a time, because fewer-but-serial is slower than many-but-parallel. Fewer *and*
-        // parallel is what is actually wanted.
         let chunks: Vec<&[&Job]> = wanted.chunks(PREFIX_BATCH).collect();
-        let asked: usize = crate::concurrency::map_with(PREFIX_BATCHES_AT_ONCE, &chunks, |chunk| {
-            let packages: Vec<(String, String, String, String)> = chunk
-                .iter()
-                .filter_map(|job| {
-                    let (channel, installed) = job.follow_up.as_ref()?;
-                    Some((
-                        channel.clone(),
-                        job.display_name.clone(),
-                        installed.clone(),
-                        job.build.clone(),
-                    ))
-                })
-                .collect();
-            if packages.len() != chunk.len() {
-                return 0;
-            }
-            let body = prefix_batch_query(&packages);
-            let Ok(answer) = fetch(&chunk[0].url, Some(&body)) else {
-                // The batch is an optimisation; its failure is the ordinary path's problem to
-                // report, once, per package, with the cause.
-                tracing::debug!(packages = chunk.len(), "a batched lookup failed; asking one at a time");
-                return 0;
-            };
-            for (index, job) in chunk.iter().enumerate() {
+
+        // Phase one: ask. Throttled, because one batched query is several packages' worth of work
+        // for the index, and ten of those at once would be a tenfold spike in what it handles.
+        let fetched: Vec<Vec<(&Job, String)>> =
+            crate::concurrency::map_with(PREFIX_BATCHES_AT_ONCE, &chunks, |chunk| {
+                let packages: Vec<(String, String, String, String)> = chunk
+                    .iter()
+                    .filter_map(|job| {
+                        let (channel, installed) = job.follow_up.as_ref()?;
+                        Some((
+                            channel.clone(),
+                            job.display_name.clone(),
+                            installed.clone(),
+                            job.build.clone(),
+                        ))
+                    })
+                    .collect();
+                if packages.len() != chunk.len() {
+                    return Vec::new();
+                }
+                let body = prefix_batch_query(&packages);
+                let Ok(answer) = fetch(&chunk[0].url, Some(&body)) else {
+                    // The batch is an optimisation; its failure is the ordinary path's problem to
+                    // report, once, per package, with the cause.
+                    tracing::debug!(packages = chunk.len(), "a batched lookup failed; asking one at a time");
+                    return Vec::new();
+                };
                 // An alias may be null where the rest of the document is good: one package failing
                 // is not the batch failing, and that package falls through to its own request.
-                let Some(single) = prefix_alias(&answer, index) else {
-                    continue;
-                };
-                let resolved = self.resolve(job, single, fetch);
+                chunk
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, job)| prefix_alias(&answer, index).map(|single| (*job, single)))
+                    .collect()
+            });
+        let asked = fetched.iter().filter(|answers| !answers.is_empty()).count();
+        let answers: Vec<(&Job, String)> = fetched.into_iter().flatten().collect();
+
+        // Phase two: make sense of each answer, which for anything behind means one more request to
+        // date its newest release.
+        //
+        // Doing that inside the loop above made it **serial within a batch**: five stale packages
+        // in one batch became five round trips one after another, which on a high-latency link was
+        // slower than not batching at all. These are ordinary single-package requests and belong on
+        // the ordinary request pool, where they ran before batching existed.
+        let resolved: Vec<(usize, String)> = crate::concurrency::map(
+            &answers,
+            None,
+            |(job, _)| job.display_name.clone(),
+            |(job, single)| {
+                // Every package here was a cache miss — that is why it was in the batch — so the
+                // tally records the fetch. Without this a cold run reports itself as fully cached.
+                crate::cache::miss(crate::cache::Service::Outdated);
+                let resolved = self.resolve(job, single.clone(), fetch);
                 if crate::cache::may_write(crate::cache::Service::Outdated)
                     && let Err(err) = job
                         .cache_file
@@ -1040,16 +1070,15 @@ impl Lookup<'_> {
                 {
                     tracing::debug!(path = %job.cache_file.display(), %err, "cannot cache a batched answer");
                 }
-            }
-            1
-        })
-        .into_iter()
-        .sum();
+                (job.index, resolved)
+            },
+        );
         tracing::debug!(
             packages = wanted.len(),
             requests = asked,
             "asked the index about several packages per request"
         );
+        resolved.into_iter().collect()
     }
 
     fn document(&self, job: &Job, fetch: Fetch<'_>, now: SystemTime) -> (Option<String>, bool) {
@@ -1106,6 +1135,58 @@ pub fn age_in_days(published: &str, now: SystemTime) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_batch_asks_once_for_the_group_and_once_more_only_for_what_needs_dating() {
+        // Guards the shape of the batch path: one request for the group, then at most one per
+        // package to date a newer release. An earlier version ran that second set *inside* the
+        // batch loop, which made them serial — same request count, several times the wall time on
+        // a high-latency link. Counting here keeps the first half honest; the parallelism is
+        // measured rather than asserted, because a timing test on CI would only be flaky.
+        use crate::format::testing::sample_sbom;
+        let dir = tempfile::tempdir().unwrap();
+        let mut sbom = sample_sbom();
+        for package in &mut sbom.packages {
+            if package.kind == PackageKind::CondaBinary {
+                package.properties.insert(
+                    "pixi:channel-url".into(),
+                    "https://conda.anaconda.org/conda-forge/".into(),
+                );
+            }
+        }
+        let asked = std::sync::Mutex::new(Vec::new());
+        let fetch = |url: &str, body: Option<&str>| {
+            let batched = body.is_some_and(|body| body.contains("p1: package"));
+            asked.lock().unwrap().push(if batched { "batch" } else { "single" });
+            let _ = url;
+            // Every package is behind, so each one also wants its newest release dated.
+            Ok(serde_json::json!({
+                "data": {
+                    "p0": {"versions": {"page": [{"version": "9.9.9"}]}},
+                    "p1": {"versions": {"page": [{"version": "9.9.9"}]}},
+                    "package": {"versions": {"page": [{"version": "9.9.9"}]}}
+                }
+            })
+            .to_string())
+        };
+        let lookup = Lookup {
+            index_url: "https://index.example/pypi",
+            anaconda_url: "https://anaconda.example",
+            index_is_configured: false,
+            kind: crate::cli::CondaIndexKind::Prefix,
+            prefix_index_url: "https://prefix.example/api/graphql",
+            cache_dir: dir.path(),
+        };
+        lookup.run_with(&sbom, &fetch, SystemTime::now(), crate::progress::Progress::default());
+
+        let asked = asked.lock().unwrap();
+        let batches = asked.iter().filter(|kind| **kind == "batch").count();
+        assert_eq!(batches, 1, "the conda packages are asked for in one query: {asked:?}");
+        assert!(
+            asked.len() > batches,
+            "and dating a newer release still costs its own request: {asked:?}"
+        );
+    }
+
     #[test]
     fn a_batch_is_gentler_on_the_index_than_the_requests_it_replaces() {
         // Batching must not become a way to hit an upstream harder. Total work is unchanged — the
