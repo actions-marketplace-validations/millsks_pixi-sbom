@@ -209,6 +209,7 @@ pub fn sbom_from_lock(
         excluded: Vec::new(),
         declared_missing: Vec::new(),
         incomplete: crate::model::Incomplete::default(),
+        lifecycles: vec![crate::model::PHASE_LOCKFILE.into()],
     })
 }
 
@@ -486,7 +487,7 @@ fn location_string(location: &UrlOrPath) -> String {
     }
 }
 
-fn local_path_reference(path: &str) -> String {
+pub(crate) fn local_path_reference(path: &str) -> String {
     let forward = path.replace('\\', "/");
     let drive =
         forward.as_bytes().get(1) == Some(&b':') && forward.as_bytes().first().is_some_and(u8::is_ascii_alphabetic);

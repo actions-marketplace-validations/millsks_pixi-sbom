@@ -7,7 +7,7 @@
 use pixi_sbom::{
     auditable, batch, cache, cli, concurrency, condaarchive, config, diff, discover, doctor, embedded, explain, filter,
     format, fromsbom, http, imports, kev, license, lock, manifest, mapping, mirror, model, osv, outdated, phantom,
-    pkgcache, policy, prefix, progress, pypi, report, scorecard, style, timings, vulnpolicy, wheel,
+    pkgcache, poetry, policy, prefix, progress, pylock, pypi, report, scorecard, style, timings, uv, vulnpolicy, wheel,
 };
 
 /// The system allocator on macOS and Windows is slow under the many small allocations a
@@ -195,6 +195,31 @@ fn main() -> Result<()> {
             },
         }),
         (None, Some(_)) => None,
+        // A PEP 751 lockfile, recognised by its name; anything else given as --lockfile is read as pixi.lock.
+        (None, None) if poetry::is_poetry_lock_name(&lockfile) => {
+            let poetry::Loaded { lock, contents } = timings::time(timings::Phase::Input, || poetry::load(&lockfile))?;
+            Some(Input::Poetry {
+                lock,
+                contents,
+                manifest: timings::time(timings::Phase::Manifest, || manifest::read(&lockfile)),
+            })
+        }
+        (None, None) if uv::is_uv_lock_name(&lockfile) => {
+            let uv::Loaded { lock, contents } = timings::time(timings::Phase::Input, || uv::load(&lockfile))?;
+            Some(Input::Uv {
+                lock,
+                contents,
+                manifest: timings::time(timings::Phase::Manifest, || manifest::read(&lockfile)),
+            })
+        }
+        (None, None) if pylock::is_pylock_name(&lockfile) => {
+            let pylock::Loaded { lock, contents } = timings::time(timings::Phase::Input, || pylock::load(&lockfile))?;
+            Some(Input::Pylock {
+                lock,
+                contents,
+                manifest: timings::time(timings::Phase::Manifest, || manifest::read(&lockfile)),
+            })
+        }
         (None, None) => {
             let lock::LoadedLock { lock, contents } = timings::time(timings::Phase::Input, || lock::load(&lockfile))?;
             Some(Input::Lock {
@@ -231,6 +256,30 @@ fn main() -> Result<()> {
             let input = input.expect("only a scan leaves the input unread");
             let targets = match &input {
                 Input::Lock { lock, .. } => resolve_targets(&args, lock, &lockfile, None)?,
+                Input::Poetry { .. } => {
+                    refuse_workspace_flags(&args, "poetry.lock");
+                    vec![Target {
+                        environment: "default".to_string(),
+                        platform: args.platform.clone(),
+                        output: discover::resolve_output(args.output.as_deref(), &lockfile, args.format),
+                    }]
+                }
+                Input::Uv { .. } => {
+                    refuse_workspace_flags(&args, "uv.lock");
+                    vec![Target {
+                        environment: "default".to_string(),
+                        platform: args.platform.clone(),
+                        output: discover::resolve_output(args.output.as_deref(), &lockfile, args.format),
+                    }]
+                }
+                Input::Pylock { .. } => {
+                    refuse_workspace_flags(&args, "pylock.toml");
+                    vec![Target {
+                        environment: pylock::environment_name(&lockfile),
+                        platform: args.platform.clone(),
+                        output: discover::resolve_output(args.output.as_deref(), &lockfile, args.format),
+                    }]
+                }
                 Input::Prefix { dir, .. } => vec![Target {
                     environment: prefix::environment_name(dir),
                     platform: args.platform.clone(),
@@ -877,6 +926,28 @@ fn report_gates(failed: &[&Gate]) {
     let _ = stderr.flush();
 }
 
+/// Refuse the flags that choose among a pixi workspace's environments and platforms, for an input
+/// that has neither (exit 2). `-e` is caught only when it names something other than the default.
+fn refuse_workspace_flags(args: &cli::Args, input: &str) {
+    for (set, flag) in [
+        (args.all_environments, "--all-environments"),
+        (args.all_platforms, "--all-platforms"),
+        (args.environment != "default", "--environment"),
+    ] {
+        if set {
+            cli::Args::command()
+                .error(
+                    clap::error::ErrorKind::ArgumentConflict,
+                    format!(
+                        "'{flag}' chooses among a pixi workspace's environments and platforms, and {input} has none; \
+                         choose the platform with '--platform'"
+                    ),
+                )
+                .exit();
+        }
+    }
+}
+
 /// The relationships between settings that clap cannot check, because a configuration file
 /// may supply either side. Every violation is a usage error (exit 2).
 fn validate(args: &cli::Args) {
@@ -1519,6 +1590,25 @@ enum Input {
         contents: String,
         manifest: manifest::Manifest,
     },
+    /// A `poetry.lock`, with its text and the manifest beside it (the project's name and what it
+    /// asked for live there, not in the lock).
+    Poetry {
+        lock: poetry::PoetryLock,
+        contents: String,
+        manifest: manifest::Manifest,
+    },
+    /// A `uv.lock`, with its text and the manifest beside it.
+    Uv {
+        lock: uv::UvLock,
+        contents: String,
+        manifest: manifest::Manifest,
+    },
+    /// A PEP 751 `pylock.toml`, with its text and the manifest beside it (for the project's name).
+    Pylock {
+        lock: pylock::Pylock,
+        contents: String,
+        manifest: manifest::Manifest,
+    },
     /// An installed environment (`--prefix`).
     Prefix { dir: std::path::PathBuf, root: model::Root },
     /// An existing document (`--from-sbom`), already read into the model.
@@ -1619,6 +1709,49 @@ fn model_for(workspace: &Workspace, environment: &str, platform: Option<&str>) -
                 &discover::lockfile_name(lockfile),
             )?;
             // What the workspace asked for itself, as opposed to what came along.
+            manifest.apply(&mut sbom);
+            (sbom, contents.clone())
+        }
+        Input::Poetry {
+            lock,
+            contents,
+            manifest,
+        } => {
+            let mut sbom = poetry::build_sbom(
+                lock,
+                platform,
+                manifest.root.clone(),
+                &discover::lockfile_name(lockfile),
+            )?;
+            manifest.apply(&mut sbom);
+            (sbom, contents.clone())
+        }
+        Input::Uv {
+            lock,
+            contents,
+            manifest,
+        } => {
+            let mut sbom = uv::build_sbom(
+                lock,
+                platform,
+                manifest.root.clone(),
+                &discover::lockfile_name(lockfile),
+            )?;
+            manifest.apply(&mut sbom);
+            (sbom, contents.clone())
+        }
+        Input::Pylock {
+            lock,
+            contents,
+            manifest,
+        } => {
+            let mut sbom = pylock::build_sbom(
+                lock,
+                environment,
+                platform,
+                manifest.root.clone(),
+                &discover::lockfile_name(lockfile),
+            )?;
             manifest.apply(&mut sbom);
             (sbom, contents.clone())
         }

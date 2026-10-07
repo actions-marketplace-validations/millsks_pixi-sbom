@@ -365,12 +365,7 @@ pub(crate) fn document(sbom: &Sbom, ctx: &WriteContext) -> Document {
             created: Some(created),
             created_by: Some(created_by),
             created_using: Some(vec![tool_id]),
-            comment: Some(format!(
-                "Generated from the pixi {} (environment {}, platform {}) before any build",
-                sbom.input_description(),
-                sbom.environment,
-                sbom.platform
-            )),
+            comment: Some(super::generation_comment(sbom, true)),
             ..Node::default()
         },
     );
@@ -420,7 +415,8 @@ pub(crate) fn document(sbom: &Sbom, ctx: &WriteContext) -> Document {
         node.package_url = Some(package.purl.clone());
         let is_url = package.location.contains("://");
         node.download_location = is_url.then(|| package.location.clone());
-        node.source_info = (!is_url).then(|| format!("built from source at {}", package.location));
+        node.source_info =
+            (!is_url && !package.location.is_empty()).then(|| format!("built from source at {}", package.location));
         node.supplied_by = package.supplier.as_ref().map(|s| b.supplier(&s.name, s.url.as_deref()));
         let mut identifiers: Vec<ExternalIdentifier> = package
             .extra_purls
@@ -630,7 +626,13 @@ pub(crate) fn document(sbom: &Sbom, ctx: &WriteContext) -> Document {
     // The SBOM and the document that carries it.
     let (sbom_id, mut bom) = b.element("software_Sbom", "sbom");
     bom.name = Some(name.clone());
-    bom.sbom_type = Some(vec!["build"]);
+    let mut sbom_types: Vec<&'static str> = sbom
+        .lifecycles
+        .iter()
+        .filter_map(|p| super::phase_to_spdx3(p))
+        .collect();
+    sbom_types.dedup();
+    bom.sbom_type = (!sbom_types.is_empty()).then_some(sbom_types);
     bom.root_element = Some(vec![root_id]);
     bom.element = Some(elements);
     bom.profile_conformance = Some(profiles.clone());

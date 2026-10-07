@@ -9,7 +9,6 @@ use crate::model::{Author, LicenseFile, Package, PackageKind, Sbom, Supplier, Vu
 
 const ROOT_REF: &str = "root";
 /// The document is derived from a lockfile, i.e. from resolved inputs before any build runs.
-const LIFECYCLE_PHASE: &str = "pre-build";
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -140,6 +139,7 @@ impl SpecVersion {
 #[serde(rename_all = "camelCase")]
 struct Metadata {
     timestamp: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     lifecycles: Vec<Lifecycle>,
     tools: Tools,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -150,7 +150,7 @@ struct Metadata {
 
 #[derive(Debug, Serialize)]
 struct Lifecycle {
-    phase: &'static str,
+    phase: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -289,7 +289,13 @@ pub(crate) fn document(sbom: &Sbom, ctx: &WriteContext) -> Bom {
         version: 1,
         metadata: Metadata {
             timestamp,
-            lifecycles: vec![Lifecycle { phase: LIFECYCLE_PHASE }],
+            // The phase the input describes: a lockfile before anything is built, an installed
+            // environment in operation, or whatever the source document said.
+            lifecycles: sbom
+                .lifecycles
+                .iter()
+                .map(|phase| Lifecycle { phase: phase.clone() })
+                .collect(),
             tools: Tools {
                 components: vec![tool_component(ctx)],
             },
@@ -602,20 +608,23 @@ fn component(package: &Package) -> Component {
         purl: Some(package.purl.clone()),
         hashes,
         licenses,
-        external_references: std::iter::once(ExternalReference {
-            kind: if package.location.starts_with("git+") {
-                "vcs"
-            } else {
-                "distribution"
-            },
-            url: package.location.clone(),
-        })
-        .chain(project_references(
-            package.homepage.as_deref(),
-            package.repository.as_deref(),
-            package.documentation.as_deref(),
-        ))
-        .collect(),
+        // A package may have no known location: Poetry records file names and hashes, not URLs.
+        external_references: (!package.location.is_empty())
+            .then(|| ExternalReference {
+                kind: if package.location.starts_with("git+") {
+                    "vcs"
+                } else {
+                    "distribution"
+                },
+                url: package.location.clone(),
+            })
+            .into_iter()
+            .chain(project_references(
+                package.homepage.as_deref(),
+                package.repository.as_deref(),
+                package.documentation.as_deref(),
+            ))
+            .collect(),
         properties,
     }
 }
