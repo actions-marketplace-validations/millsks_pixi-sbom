@@ -172,7 +172,7 @@ fn no_lockfile_in_tree_fails_with_help() {
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "no pixi.lock, uv.lock, poetry.lock, pdm.lock or pylock.toml found",
+            "no pixi.lock, uv.lock, pylock.toml, poetry.lock, pdm.lock or conda-lock.yml found",
         ))
         .stderr(predicate::str::contains("--lockfile"));
 }
@@ -707,7 +707,7 @@ fn the_run_says_which_input_and_which_settings_it_chose() {
             .clone(),
     )
     .unwrap();
-    assert!(scan.contains("every pixi.lock under this directory"), "{scan}");
+    assert!(scan.contains("one lockfile per project under this directory"), "{scan}");
     assert!(scan.contains("not from each workspace"), "{scan}");
 }
 
@@ -7820,4 +7820,228 @@ fn what_was_requested_by_name_is_direct_in_an_installed_environment() {
         .find(|d| d["ref"] == doc["metadata"]["component"]["bom-ref"])
         .unwrap();
     assert_eq!(root["dependsOn"], serde_json::json!(["pkg:pypi/requests@2.34.2"]));
+}
+
+#[test]
+fn infer_extras_is_opt_in_and_labelled() {
+    // #334: off by default; with the flag, the inference is marked as such.
+    let work = tempfile::tempdir().unwrap();
+    let venv = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/venv-extras");
+    let requests = |args: &[&str]| -> Value {
+        let output = pixi_sbom()
+            .current_dir(work.path())
+            .env("PIXI_CACHE_DIR", work.path().join("empty-pkgs-cache"))
+            .env("PIXI_SBOM_CACHE_DIR", work.path().join("cache"))
+            .env("PIXI_SBOM_OFFLINE", "1")
+            .args(["--prefix", venv.to_str().unwrap(), "--output", "-"])
+            .args(args)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let doc: Value = serde_json::from_slice(&output).unwrap();
+        doc["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "requests")
+            .unwrap()
+            .clone()
+    };
+    let names = |c: &Value| -> Vec<String> {
+        c["properties"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["name"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert!(
+        !names(&requests(&[])).iter().any(|n| n.contains("extras")),
+        "off by default"
+    );
+    let inferred = requests(&["--infer-extras"]);
+    for key in [
+        "pixi:python-extras",
+        "pixi:python-extras-inferred",
+        "pixi:python-extras-evidence",
+    ] {
+        assert!(names(&inferred).iter().any(|n| n == key), "{key}");
+    }
+
+    // The configuration file can turn it on, and the flag needs --prefix.
+    std::fs::write(work.path().join("pixi-sbom.toml"), "infer-extras = true\n").unwrap();
+    assert!(names(&requests(&[])).iter().any(|n| n == "pixi:python-extras-inferred"));
+    pixi_sbom()
+        .current_dir(work.path())
+        .args(["--infer-extras", "--no-config"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("--prefix"));
+}
+
+#[test]
+fn a_scan_reads_every_kind_of_lockfile_once_per_project() {
+    // #339: a monorepo of pixi, uv and Poetry projects; one directory has pixi.lock and uv.lock.
+    let tree = tempfile::tempdir().unwrap();
+    let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/projects");
+    let place = |dir: &str, from: &Path, files: &[&str]| {
+        let target = tree.path().join(dir);
+        std::fs::create_dir_all(&target).unwrap();
+        for file in files {
+            std::fs::copy(from.join(file), target.join(file)).unwrap();
+        }
+    };
+    place(
+        "services/pixi-app",
+        &tests_dir().join("fixtures/conda-only"),
+        &["pixi.toml", "pixi.lock"],
+    );
+    place(
+        "services/uv-app",
+        &examples.join("uv/01-django"),
+        &["pyproject.toml", "uv.lock"],
+    );
+    place(
+        "libs/poetry-lib",
+        &examples.join("poetry/01-django"),
+        &["pyproject.toml", "poetry.lock"],
+    );
+    place(
+        "both",
+        &tests_dir().join("fixtures/conda-only"),
+        &["pixi.toml", "pixi.lock"],
+    );
+    place("both", &examples.join("uv/01-django"), &["uv.lock"]);
+
+    let assert = pixi_sbom()
+        .current_dir(tree.path())
+        .env("PIXI_CACHE_DIR", tree.path().join(".empty-pkgs-cache"))
+        .env("PIXI_SBOM_CACHE_DIR", tree.path().join(".cache"))
+        .env("PIXI_SBOM_OFFLINE", "1")
+        .args(["-p", "linux-64", "--scan", "."])
+        .assert()
+        .success();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("several lockfiles in one directory") && stderr.contains("chosen=pixi.lock"),
+        "{stderr}"
+    );
+    for (dir, lockfile) in [
+        ("services/pixi-app", "pixi.lock"),
+        ("services/uv-app", "uv.lock"),
+        ("libs/poetry-lib", "poetry.lock"),
+        ("both", "pixi.lock"),
+    ] {
+        let doc = read_json(&tree.path().join(dir).join("sbom.cdx.json"));
+        let recorded = doc["metadata"]["properties"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == "pixi:lockfile")
+            .map(|p| p["value"].as_str().unwrap().to_string());
+        assert_eq!(recorded.as_deref(), Some(lockfile), "{dir}");
+    }
+}
+
+#[test]
+fn a_venv_is_checked_against_its_uv_lock_or_pylock() {
+    // #340: --against reads uv.lock and pylock.toml like --lockfile does.
+    let work = tempfile::tempdir().unwrap();
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    // The venv-posix fixture without the pip that `python -m venv` seeds: what `uv sync` leaves.
+    let venv = work.path().join("venv");
+    let copy = |from: &Path, to: &Path| {
+        for entry in walkdir(from) {
+            let target = to.join(entry.strip_prefix(from).unwrap());
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::copy(&entry, &target).unwrap();
+        }
+    };
+    copy(&fixtures.join("venv-posix"), &venv);
+    std::fs::remove_dir_all(venv.join("lib/python3.12/site-packages/pip-25.2.dist-info")).unwrap();
+    let check = |against: &str| {
+        let mut command = pixi_sbom();
+        command
+            .current_dir(work.path())
+            .env("PIXI_CACHE_DIR", work.path().join("empty-pkgs-cache"))
+            .env("PIXI_SBOM_CACHE_DIR", work.path().join("cache"))
+            .env("PIXI_SBOM_OFFLINE", "1")
+            .args([
+                "--prefix",
+                venv.to_str().unwrap(),
+                "--report",
+                "diff",
+                "--fail-on-diff",
+                "any",
+                "--against",
+            ])
+            .arg(fixtures.join("uv-drift").join(against));
+        command
+    };
+    for against in ["uv.lock", "pylock.toml"] {
+        let assert = check(against).assert().success();
+        let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+        assert!(out.contains("No changes against"), "{against}: {out}");
+    }
+
+    // Someone ran `pip install six` in the venv.
+    let six = venv.join("lib/python3.12/site-packages/six-1.17.0.dist-info");
+    std::fs::create_dir_all(&six).unwrap();
+    std::fs::write(
+        six.join("METADATA"),
+        "Metadata-Version: 2.1\nName: six\nVersion: 1.17.0\n",
+    )
+    .unwrap();
+    std::fs::write(six.join("INSTALLER"), "pip\n").unwrap();
+    for against in ["uv.lock", "pylock.toml"] {
+        check(against)
+            .assert()
+            .code(6)
+            .stderr(predicate::str::contains("pip installed (1)"));
+    }
+
+    // A conda prefix against uv.lock compares the PyPI packages and counts the conda ones out.
+    let output = pixi_sbom()
+        .current_dir(work.path())
+        .env("PIXI_CACHE_DIR", work.path().join("empty-pkgs-cache"))
+        .env("PIXI_SBOM_CACHE_DIR", work.path().join("cache"))
+        .env("PIXI_SBOM_OFFLINE", "1")
+        .args([
+            "--prefix",
+            fixtures.join("prefix").to_str().unwrap(),
+            "--report",
+            "diff",
+        ])
+        .args(["--report-format", "json", "--against"])
+        .arg(fixtures.join("uv-drift/uv.lock"))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(report["out_of_scope"], 3, "{report}");
+    assert!(
+        report["removed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|p| p["kind"] == "pypi")
+    );
+}
+
+/// Every file under `dir`.
+fn walkdir(dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            files.extend(walkdir(&path));
+        } else {
+            files.push(path);
+        }
+    }
+    files
 }

@@ -18,7 +18,7 @@ With no options this means:
 
 | Option | Default | Effect |
 |---|---|---|
-| `--lockfile <PATH>` | upward search from cwd | Lockfile to read: a `pixi.lock`, a `uv.lock` (see [Reading uv.lock](#reading-uvlock)), a `poetry.lock` (see [Reading poetry.lock](#reading-poetrylock)), a `pdm.lock` (see [Reading pdm.lock](#reading-pdmlock)), a `conda-lock.yml` (see [Reading conda-lock.yml](#reading-conda-lockyml)), an explicit conda spec file (see [Reading an explicit spec file](#reading-an-explicit-spec-file)), or a PEP 751 `pylock.toml` / `pylock.<name>.toml` (see [Reading pylock.toml](#reading-pylocktoml)). The file must exist; there is no fallback search when this is given. Without it, the nearest directory at or above the current one that has `pixi.lock`, `uv.lock`, `poetry.lock`, `pdm.lock` or `pylock.toml` is used, in that order of preference within a directory. |
+| `--lockfile <PATH>` | upward search from cwd | Lockfile to read: a `pixi.lock`, a `uv.lock` (see [Reading uv.lock](#reading-uvlock)), a `poetry.lock` (see [Reading poetry.lock](#reading-poetrylock)), a `pdm.lock` (see [Reading pdm.lock](#reading-pdmlock)), a `conda-lock.yml` (see [Reading conda-lock.yml](#reading-conda-lockyml)), an explicit conda spec file (see [Reading an explicit spec file](#reading-an-explicit-spec-file)), or a PEP 751 `pylock.toml` / `pylock.<name>.toml` (see [Reading pylock.toml](#reading-pylocktoml)). The file must exist; there is no fallback search when this is given. Without it, the nearest directory at or above the current one that has a lockfile is used, and within a directory the first in the order of [Which lockfile is found](#which-lockfile-is-found). |
 | `--prefix <DIR>` | | Describe an installed environment instead of a lockfile: a conda environment, a venv or a Python installation (see below). Cannot be combined with `--lockfile` or the `--all-*` flags; `--environment` only names the lockfile side of `--against`. |
 | `--root-name <NAME>`, `--root-version <VERSION>` | directory name, none | With `--prefix`: what the described application is called. |
 | `--config <PATH>` | see below | Configuration file to read before the command line. |
@@ -40,6 +40,7 @@ With no options this means:
 | `--fetch-licenses` | off | Fetch the license of every package, conda and PyPI alike, where the lockfile has none, plus the names of the license files it ships and its summary and project URLs. Conda details come from the local package cache pixi filled at install time, or from the archive on the channel via HTTP range requests (a few KB per package, cached); PyPI details from the wheel's `dist-info` the same way, then the index JSON API for what is still missing. Failures are logged and the run continues. |
 | `--license-texts` | off | With `--fetch-licenses`, also embed the full text of every license file. Each file is capped at 1 MiB and the document holds at most 64 MiB of text in total; past that the files are listed by name and the document says so (see [incomplete enrichment](output-format.md#incomplete-enrichment)). |
 | `--embedded-sboms` | off | Add the components declared by SBOMs embedded in wheels (PEP 770, e.g. the Rust crates maturin compiled in) as dependencies of the wheel. Reads each wheel's `dist-info` like `--fetch-licenses`. With `--prefix`, also reads the `cargo auditable` crate list out of the environment's binaries. |
+| `--infer-extras` | off | With `--prefix`: infer which extras each Python package was installed with, from what is installed, and label it as inferred (see [Python extras](#python-extras)). |
 | `--allow-license <LICENSE>` | | Repeatable. Only these SPDX licenses are acceptable; a package whose license expression cannot be satisfied with them alone is a violation. |
 | `--deny-license <LICENSE>` | | Repeatable. These SPDX licenses are unacceptable; a package whose expression cannot be satisfied without them is a violation. |
 | `--require-license` | off | Every package must declare a license that is an SPDX expression. |
@@ -83,9 +84,9 @@ Nothing in this table is scheduled for removal; dropping any of it would be a ma
 | `--assume-used <GLOB>` | | With `--report phantom`: packages matching this are never reported as unused or undeclared (repeatable). |
 | `--fail-on-phantom` | off | With `--report phantom`: exit **8** when the workspace imports a package it never declared. |
 | `--from-sbom <FILE>` | | Read an existing document (CycloneDX 1.4–1.7, SPDX 2.x or SPDX 3.0 JSON) instead of a lockfile and run the reports, the license policy and the vulnerability gate on it. |
-| `--scan <DIR>` | | Describe every pixi workspace under the directory: one document per `pixi.lock` found. Cannot be combined with `--lockfile`, `--prefix`, `--against` or `--output -`. |
+| `--scan <DIR>` | | Describe every project under the directory: one document per directory with a lockfile of any kind it finds (see [Which lockfile is found](#which-lockfile-is-found)). Cannot be combined with `--lockfile`, `--prefix`, `--against` or `--output -`. |
 | `--scan-depth <N>` | unlimited | With `--scan`: how far below the directory to walk (`0` is the directory itself). |
-| `--against <PATH>` | | With `--report diff`: what to compare with — a document (CycloneDX 1.4–1.7, SPDX 2.x or SPDX 3.0 JSON), a `pixi.lock`, or the directory of an installed environment. |
+| `--against <PATH>` | | With `--report diff`: what to compare with — a document (CycloneDX 1.4–1.7, SPDX 2.x or SPDX 3.0 JSON), any lockfile `--lockfile` reads (`pixi.lock`, `uv.lock`, `pylock.toml`, `poetry.lock`, `pdm.lock`, `conda-lock.yml`, an explicit spec file), or the directory of an installed environment (conda, venv or plain Python). |
 | `--fail-on-diff [<SECTION>...]` | off | With `--report diff`: exit **6** when the named sections (`added`, `removed`, `version`, `license`, `build`, `pip`) are not empty. The bare flag means any change. |
 | `--explain <PACKAGE>` | | Repeatable. Print every fact the tool has about the packages matching this name or shell-style pattern (as in `--exclude`) and where each fact came from, including the sources that came back empty (see below). Prints instead of writing, so it cannot be combined with `--output` or `--report`. |
 | `--report-format <table\|markdown\|csv\|json\|sarif>` | `table` | How to render the report or `--explain`; `sarif` (2.1.0, for GitHub code scanning) applies to `--report vulnerabilities` only. |
@@ -115,6 +116,32 @@ executables, which is what makes `pixi sbom` work; before that the binary is sti
 by its own name.
 
 Dropping support for a lockfile version would be a breaking change, and after 1.0 that means a major version.
+
+### Which lockfile is found
+
+Without `--lockfile`, the search walks up from the working directory and reads the lockfile of the nearest
+directory that has one; `--scan` reads one per directory under the one it is given. Both know the same names, and
+when a directory has several, both take the first in this order and log which one they chose and what else was
+there:
+
+1. `pixi.lock`: the most complete, and a pixi workspace that also has a `uv.lock` (pixi uses uv underneath) is a
+   pixi workspace
+2. `uv.lock`
+3. `pylock.toml`, then the named `pylock.<name>.toml` files, sorted
+4. `poetry.lock`
+5. `pdm.lock`
+6. `conda-lock.yml`
+
+One directory is one project, so a project with both a `pixi.lock` and a `uv.lock` gets one document, not two; pass
+`--lockfile` to read the other. An explicit conda spec file has no fixed name, so it is never discovered and only
+read through `--lockfile`. When nothing is found, `pixi_sbom::discover::not_found` (or `none_found` for `--scan`)
+lists the names it looked for:
+
+```text
+  × no pixi.lock, uv.lock, pylock.toml, poetry.lock, pdm.lock or conda-lock.yml found in /work/app or any parent directory
+  help: write one with your project's tool (`pixi lock`, `uv lock`, `poetry lock`, `pdm lock`, `pip lock`, `conda-lock`),
+        or pass --lockfile with the path to one; an explicit conda spec file is only read that way
+```
 
 ## What the log says, and how to narrow it
 
@@ -414,6 +441,21 @@ were asked for, two properties record it.
 `pdm.lock` does not say which of the project's groups are extras, so a package there for one of the project's own
 extras is labelled only through `pixi:declared-in`. An installed environment (`--prefix`) records no extras.
 `--explain <package>` shows both: *installed with extras* and *brought in by*.
+
+### Inferring extras in an installed environment
+
+A venv or conda environment records which packages are installed, not which extras they were installed with.
+`--infer-extras` (with `--prefix`, off by default; `infer-extras = true` in the configuration file) guesses: an extra
+of a package counts as active when it gates at least one `Requires-Dist` whose other markers hold for the
+environment's interpreter and platform, and every such requirement is installed. `requests` with `pysocks` installed
+is taken to have `socks`; with `chardet` missing it is not taken to have `use-chardet-on-py3`.
+
+The result is written as `pixi:python-extras`, the same as a stated extra, plus `pixi:python-extras-inferred = true`
+and `pixi:python-extras-evidence` (`socks: pysocks`), so a consumer can tell inference from fact. `--explain` says the
+extras were inferred and from which packages. The guess can be wrong: the packages an extra needs may have been
+installed for another reason, or by hand, and an extra that gates nothing on this platform is never inferred. A
+package whose extras the input already states keeps those. Without a known interpreter version (no `python`
+package, no `pyvenv.cfg`, no `pythonX.Y` path) nothing is inferred.
 
 A `pylock.toml` whose markers name extras or dependency groups (`'s3' in extras`) is read with every extra and
 group it lists counted as chosen, because the document describes all of them.
@@ -1235,6 +1277,28 @@ With `--prefix` the document is named after the environment's directory, which s
 a lockfile run with `--against <prefix directory>` — and between two lockfiles, where `--against pixi.lock` on the
 workspace's own lockfile is the "nothing has changed" baseline.
 
+### Does this venv still match its lock?
+
+`--against` reads every lockfile `--lockfile` reads, through the same reader, so the same check works for a venv:
+
+```sh
+pixi sbom --prefix .venv --against uv.lock --report diff --fail-on-diff any
+pixi sbom --prefix /app/.venv --against pylock.toml --report diff --fail-on-diff pip
+```
+
+The lockfile is read for the platform the venv was described for (its wheels' platform, or `--platform`), and a
+`pylock.<name>.toml` for its own environment. Packages are matched by purl type and normalized name.
+
+- **Seeded tools.** `python -m venv` seeds `pip` (and older Pythons `setuptools`), which no lockfile lists, so they
+  show up as `pip` installed; leave them out with `--exclude pip`. A venv `uv` made has none.
+- **Unknown licenses.** A license one side does not know is not a change: a lockfile records none for a PyPI
+  package, while the installed `METADATA` does. Only two known, different licenses are a license change.
+- **Conda packages.** A side read from something that can only hold PyPI packages — a `uv.lock`, `pylock.toml`,
+  `poetry.lock` or `pdm.lock`, a venv, a plain Python installation — says nothing about conda packages. Compared
+  with a conda environment or a `pixi.lock`, the comparison covers the PyPI packages, and the conda ones are counted
+  rather than all reported as added or removed: `(3 conda packages out of scope: the other side describes PyPI
+  packages only)`, and `out_of_scope` in the JSON report.
+
 ## Working from an existing SBOM
 
 `--from-sbom <FILE>` reads a document instead of a lockfile, so everything the tool does to a pixi environment can
@@ -1266,9 +1330,11 @@ environment.
 
 ## A monorepo: every workspace in one run
 
-A pixi workspace has exactly one lockfile next to its manifest, so several lockfiles in a tree mean several
-workspaces. `--scan <DIR>` describes them all in one run, in sorted order, instead of a shell loop that everyone
-writes slightly differently:
+A project keeps its lockfile next to its manifest, so several lockfiles in a tree mean several projects, of any
+mix of kinds: pixi workspaces, uv, Poetry and PDM projects, conda-lock environments. `--scan <DIR>` describes them
+all in one run, in sorted order, one lockfile per directory chosen as in
+[Which lockfile is found](#which-lockfile-is-found), instead of a shell loop that everyone writes slightly
+differently:
 
 ```sh
 # One document per workspace, mirroring the tree under sboms/
@@ -1286,7 +1352,8 @@ lockfile is never mistaken for a workspace. `--scan-depth <N>` caps the recursio
 
 With `--output <DIR>` each document lands at `<DIR>/<the workspace's path in the tree>/<the usual file name>`, so
 two workspaces never collide; without it each lands next to its own lockfile. `--all-environments` and
-`--all-platforms` combine with it and keep their file naming inside each workspace's directory. Every document is
+`--all-platforms` combine with it and keep their file naming inside each pixi workspace's directory; any other kind
+of lockfile describes one environment and gets one document. Every document is
 byte-identical to what `--lockfile <that file>` would have written: the workspace name still comes from that
 workspace's manifest, `pixi:lockfile` stays relative to its own root, and the document identity is unchanged.
 
