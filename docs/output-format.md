@@ -108,7 +108,7 @@ entry).
 | `pixi:source-git`, `pixi:source-rev`, `pixi:source-tag` / `pixi:source-branch`, `pixi:source-subdirectory` | conda source (git) | The pinned build source |
 | `pixi:source-url`, `pixi:source-subdirectory` | conda source (archive) | The pinned build source; its SHA-256 goes into the hashes |
 | `pixi:source-path` | conda source (path) | Local path |
-| `pixi:direct` | any | `true` when the workspace manifest declares this package itself, rather than it coming along as somebody else's dependency. For a lockfile other than `pixi.lock`, the manifest is the `pyproject.toml` or `environment.yml` beside it (see [What a project without pixi declared](cli.md#what-a-project-without-pixi-declared)) |
+| `pixi:direct` | any | `true` when the workspace manifest declares this package itself, rather than it coming along as somebody else's dependency. For a lockfile other than `pixi.lock`, the manifest is the `pyproject.toml` or `environment.yml` beside it (see [What a project without pixi declared](cli.md#what-a-project-without-pixi-declared)) With `--prefix`, set on what the user asked for by name (`REQUESTED`, `conda-meta/history`), with `pixi:declared-in = requested` |
 | `pixi:declared-in` | any | The features whose dependency tables declare it, comma separated (`default`, `default,docs`) |
 | `pixi:license-exempt` | any | Why the license policy does not apply (`--ignore-license`); `true` when no justification was given |
 | `pixi:scorecard`, `pixi:scorecard-date` | any | With `--scorecard`: the OpenSSF Scorecard aggregate out of ten and when the repository was scored |
@@ -134,7 +134,18 @@ In SPDX these appear in the package `comment` because SPDX 2.3 has no free-form 
 | conda binary | `pkg:conda/<name>@<version>?build=<build>&channel=<channel>&subdir=<subdir>&type=<conda\|tar.bz2>` |
 | conda source | `pkg:conda/<name>@<version>?build=<build>&subdir=<subdir>` (no channel; qualifiers present only when known) |
 | PyPI | `pkg:pypi/<normalized-name>@<version>` with PEP 503 normalization (lower-case, runs of `-_.` collapsed to `-`) |
+| PyPI, from a GitHub checkout | `pkg:github/<owner>/<repo>@<commit>` |
+| PyPI, from another VCS checkout | `pkg:pypi/<normalized-name>@<version>?vcs_url=<vcs>+<repository>@<commit>` |
+| PyPI, from an archive URL | `pkg:generic/<name>@<version>?download_url=<url>` |
+| PyPI, from a local directory or archive (editable or not) | `pkg:generic/<name>@<version>` |
 | First-party workspace member (`uv.lock`) | `pkg:generic/<name>@<version>`: no registry has released it |
+
+A package installed from somewhere other than an index does not get a plain `pkg:pypi` purl, since that would claim
+a PyPI release which may not exist or may hold other code, and a scanner would match the wrong advisories. Where it
+came from stays in `pixi:direct-url`, `pixi:source-rev` and `pixi:editable`, from every lockfile reader and from
+`--prefix` (PEP 610 `direct_url.json`). `--vulnerabilities osv` asks about none of these purls: OSV has no ecosystem
+for `generic` or `github`, and a `vcs_url` checkout is not the release of its version. In `pixi.lock` a git or local
+source is recognised; a URL without an index is left as it is, since older lockfiles record index wheels that way.
 
 Purls double as the CycloneDX `bom-ref`, which is why they must be unique within a document; within one environment
 and platform they always are. The `bom-ref` / `SPDXID` is always derived from the conda purl, even when
@@ -337,7 +348,7 @@ to the graph instead of floating as extra roots.
 | | CycloneDX | SPDX |
 |---|---|---|
 | Package → package | `dependencies[]`: `{ ref, dependsOn[] }` for every component | `DEPENDS_ON` relationship per edge |
-| Root → packages | `dependencies[0]` (`ref: root`) lists what the workspace declared, plus the packages nothing else depends on; beside a lockfile that is not `pixi.lock`, with a manifest that declares something, only what it declared | `SPDXRef-Package-root DEPENDS_ON ...` for the same set |
+| Root → packages | `dependencies[0]` (`ref: root`) lists what the workspace declared, plus the packages nothing else depends on; beside a lockfile that is not `pixi.lock`, with a manifest that declares something, only what it declared; for an installed environment that recorded it, what was requested by name | `SPDXRef-Package-root DEPENDS_ON ...` for the same set |
 
 The declared half comes from the manifest next to the lockfile: the dependency tables of the environment's features
 (see [`pixi:direct`](#pixi-properties)), so a declared dependency that something else also needs — `python` is
