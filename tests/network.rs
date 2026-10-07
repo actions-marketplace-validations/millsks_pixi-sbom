@@ -158,7 +158,31 @@ fn one_agent_reuses_its_connections() {
         1,
         "{requests} serial requests should share one connection"
     );
-    assert!(server.requests().iter().all(|r| r.connection == 0 && r.method == "GET"));
+    assert!(server.requests().iter().all(|r| r.connection == 0));
+}
+
+#[test]
+fn batches_respect_a_lower_concurrency() {
+    // #354: batches are throttled to four at a time, but never above what --concurrency allows.
+    // At 1, nothing overlaps and one connection carries everything, batches included.
+    let dir = workspace("with-pypi");
+    let server = Server::start(|request, _| index(request).after(Duration::from_millis(50)));
+    outdated(
+        dir.path(),
+        &server,
+        "cache",
+        &["--conda-index-kind", "prefix", "--concurrency", "1"],
+    )
+    .assert()
+    .success();
+    let batches = server.requests().iter().filter(|r| is_batch(r)).count();
+    assert!(batches >= 2, "enough conda packages for more than one batch: {batches}");
+    assert_eq!(
+        server.peak_overlap(|_| true),
+        1,
+        "a request overlapped another at --concurrency 1"
+    );
+    assert_eq!(server.connections(), 1);
 }
 
 #[test]
