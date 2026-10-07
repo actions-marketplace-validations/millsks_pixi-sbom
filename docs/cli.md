@@ -19,7 +19,7 @@ With no options this means:
 | Option | Default | Effect |
 |---|---|---|
 | `--lockfile <PATH>` | upward search from cwd | Lockfile to read: a `pixi.lock`, a `uv.lock` (see [Reading uv.lock](#reading-uvlock)), a `poetry.lock` (see [Reading poetry.lock](#reading-poetrylock)), a `pdm.lock` (see [Reading pdm.lock](#reading-pdmlock)), a `conda-lock.yml` (see [Reading conda-lock.yml](#reading-conda-lockyml)), an explicit conda spec file (see [Reading an explicit spec file](#reading-an-explicit-spec-file)), or a PEP 751 `pylock.toml` / `pylock.<name>.toml` (see [Reading pylock.toml](#reading-pylocktoml)). The file must exist; there is no fallback search when this is given. Without it, the nearest directory at or above the current one that has `pixi.lock`, `uv.lock`, `poetry.lock`, `pdm.lock` or `pylock.toml` is used, in that order of preference within a directory. |
-| `--prefix <DIR>` | | Describe an installed environment instead of a lockfile (see below). Cannot be combined with `--lockfile`, `--environment` or the `--all-*` flags. |
+| `--prefix <DIR>` | | Describe an installed environment instead of a lockfile: a conda environment, a venv or a Python installation (see below). Cannot be combined with `--lockfile` or the `--all-*` flags; `--environment` only names the lockfile side of `--against`. |
 | `--root-name <NAME>`, `--root-version <VERSION>` | directory name, none | With `--prefix`: what the described application is called. |
 | `--config <PATH>` | see below | Configuration file to read before the command line. |
 | `--no-config` | off | Ignore any configuration file. |
@@ -276,7 +276,7 @@ records switched on, since the lockfile describes all of them. Python markers us
 `python-versions` allows. The dependency graph comes from each package's `[package.dependencies]`.
 
 The lockfile has no entry for the project itself. Its name and version come from the `pyproject.toml` beside it, and
-so does what it asked for: packages its `[project.dependencies]` declares are marked `pixi:direct`.
+so does what it asked for (see [What a project without pixi declared](#what-a-project-without-pixi-declared)).
 
 Poetry records a package's files by name and hash, but not the URL they were downloaded from. A package from an
 index therefore records which artifact this platform would install as `pixi:file-name`, with its SHA-256, and no
@@ -366,6 +366,58 @@ are in its archive's `info/index.json`, not in the file. So every package is a d
 and no edge appears that the file does not support. The packages and their hashes are exact; the structure is not
 there to read.
 
+## What a project without pixi declared
+
+With a `pixi.lock`, the workspace manifest says which packages the project asked for itself: they carry
+`pixi:direct` and `pixi:declared-in`, the root of the document depends on them, and the `packages` and `phantom`
+reports show them. The other lockfiles get the same from the manifest beside them. It is read only for what it
+declares; nothing is resolved from it.
+
+| Lockfile | Manifest | Declared |
+|---|---|---|
+| `uv.lock`, `pylock.toml`, `pdm.lock` | `pyproject.toml` | `[project.dependencies]` as `default`, each `[project.optional-dependencies]` extra under its name, each PEP 735 `[dependency-groups]` group under its name (with `include-group` expanded), and the older `[tool.uv] dev-dependencies` (`dev`) and `[tool.pdm.dev-dependencies]` groups |
+| `poetry.lock` | `pyproject.toml` | the above, and `[tool.poetry.dependencies]` (`default`, without `python`), `[tool.poetry.group.<name>.dependencies]` and the older `[tool.poetry.dev-dependencies]` (`dev`) |
+| `conda-lock.yml`, explicit spec files | `environment.yml` | its conda specs, and the requirements of its `pip:` list, as `default` |
+
+Every extra and group counts, because the readers describe all of them: `pixi:declared-in` names the ones that
+declared a package (`default`, `s3`, `test`). And because such a manifest is the only record of what the project
+asked for, the root of the document depends on exactly the packages it declared, rather than also on every package
+nothing else depends on. That second half is what a `pixi.lock` adds, and what the graph-less formats would otherwise
+turn into a claim that the project depends directly on everything. The project's name, version, authors and license
+come from `[project]` (or the `name:` of `environment.yml`).
+
+When there is no manifest beside the lockfile, the document is written without declarations, as for a bare
+lockfile before.
+
+Groups and extras also decide what each package is there for: required at run time, for development (a group), or
+optional (an extra). CycloneDX writes it as the component's `scope`, SPDX as `DEV_DEPENDENCY_OF` and
+`OPTIONAL_DEPENDENCY_OF` relationships; see [Runtime, development and optional](output-format.md#runtime-development-and-optional).
+
+## Python extras
+
+An extra pulls in more code: `requests[socks]` installs `pysocks` as well. Wherever the input says which extras
+were asked for, two properties record it.
+
+- **`pixi:python-extras`** on a package installed with extras: `socks,security`.
+- **`pixi:via-extra`** on a package that is there only because of an extra: `requests[socks]`, or `my-app[s3]` for
+  one of the project's own extras. The packages it depends on carry the same label, until one is reached that is
+  needed anyway. A package something else needs as well gets no label.
+
+| Input | Which extras were asked for | What each extra brings in |
+|---|---|---|
+| `pixi.lock` | the manifest's `extras = [...]` on a `pypi-dependencies` entry, and the other packages' requirements | `requires_dist` entries marked `extra == '...'` |
+| `uv.lock` | the `extra = [...]` on each dependency | `[package.optional-dependencies]` |
+| `poetry.lock` | the `extras` on each dependency entry | optional entries marked `extra == "..."`, and package markers for the project's own |
+| `pdm.lock` | the `extras` of each `name[extra]` entry | that entry's dependencies |
+| `pylock.toml` | not recorded per package | `'name' in extras` markers, for the project's own extras |
+
+`pdm.lock` does not say which of the project's groups are extras, so a package there for one of the project's own
+extras is labelled only through `pixi:declared-in`. An installed environment (`--prefix`) records no extras.
+`--explain <package>` shows both: *installed with extras* and *brought in by*.
+
+A `pylock.toml` whose markers name extras or dependency groups (`'s3' in extras`) is read with every extra and
+group it lists counted as chosen, because the document describes all of them.
+
 ## Reading pylock.toml
 
 A Python project that locks with the PEP 751 standard lockfile can be described without converting it to pixi.
@@ -417,20 +469,40 @@ from a PyPI purl (licenses, vulnerabilities, outdated, scorecard, diff) runs unc
 ## Describing an installed environment
 
 Not every environment has a lockfile: `pixi global` environments, plain conda / mamba / micromamba environments,
-environments inside containers. `--prefix <DIR>` describes one of those from what it keeps on disk:
+venvs, environments inside containers. `--prefix <DIR>` describes one of those from what it keeps on disk:
 
 ```sh
 pixi sbom --prefix ~/.pixi/envs/pixi-sbom
 pixi sbom --prefix /opt/conda/envs/app --root-name app --root-version 1.4.0 --fetch-licenses
+pixi sbom --prefix .venv
+pixi sbom --prefix /usr/local --platform linux-64
+```
+
+What the directory holds decides how it is read:
+
+| Found in the directory | Read as |
+|---|---|
+| `conda-meta/` | A conda environment: its conda records, plus what pip installed beside them |
+| `pyvenv.cfg`, no `conda-meta/` | A venv (`python -m venv`, `uv venv`, `virtualenv`): its site-packages |
+| Neither, but `lib/python3.*/site-packages` or `Lib/site-packages` | A Python installation, such as a container's `/usr/local`: its site-packages |
+
+A directory with none of these is refused with `pixi_sbom::prefix::not_an_environment`, which lists what it looked
+for and what the directory holds instead:
+
+```text
+  × src is not an environment: looked for conda-meta/, pyvenv.cfg, lib/python3.*/site-packages and Lib/site-packages, found auditable.rs, auth.rs, ...
 ```
 
 Conda packages come from `conda-meta/<name>-<version>-<build>.json`, which carries the same facts as a lock record
 (name, version, build, channel, subdir, hashes, license, dependencies); pip-installed packages come from the
 `site-packages/*.dist-info` directories (`METADATA` for name, version, license, summary and requirements;
 `direct_url.json` for VCS installs), skipping the ones whose `INSTALLER` is `conda`, since their conda package is
-already listed. The dependency graph is resolved as for a lockfile. The environment is named after the directory,
-the platform is the one the records name (`--platform` overrides it), and the document records `pixi:prefix`
-instead of `pixi:lockfile`. `--fetch-licenses` reads the license files from the directory each record says the
+already listed. Without conda records nothing else lists what conda put there, so every `dist-info` is a package
+whatever its `INSTALLER` says. The dependency graph is resolved as for a lockfile. The environment is named after
+the directory, the platform is the one the records name, or for a venv the one most of its wheels were built for
+(their `WHEEL` tags), and `--platform` overrides it. The document records `pixi:prefix` instead of
+`pixi:lockfile`, and for a venv or a Python installation `pixi:python-version`: the Python from `pyvenv.cfg`, or
+the `pythonX.Y` of the site-packages path. `--fetch-licenses` reads the license files from the directory each record says the
 package was extracted to (`extracted_package_dir`, the package cache), so it needs no network on the machine
 that installed the environment. The default output is `sbom.cdx.json` in the working directory, and the
 configuration file is looked up there too.

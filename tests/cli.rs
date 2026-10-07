@@ -3985,7 +3985,9 @@ fn prefix_describes_an_installed_environment_in_every_format() {
         .arg(dir.path())
         .assert()
         .code(1)
-        .stderr(predicate::str::contains("not a conda environment"));
+        .stderr(predicate::str::contains(
+            "is not an environment: looked for conda-meta/",
+        ));
     pixi_sbom()
         .current_dir(dir.path())
         .arg("--prefix")
@@ -7329,4 +7331,390 @@ fn explicit_spec_files_are_read_with_whatever_hashes_they_carry() {
         .assert()
         .code(2)
         .stderr(predicate::str::contains("an explicit spec file has none"));
+}
+
+#[test]
+fn the_manifest_beside_a_non_pixi_lockfile_says_what_the_project_declared() {
+    // #328: pyproject.toml beside uv.lock / poetry.lock, environment.yml beside conda-lock.yml.
+    let work = tempfile::tempdir().unwrap();
+    std::fs::write(work.path().join("app.py"), "import django\nimport sqlparse\n").unwrap();
+    let command = |dir: &Path, args: &[&str]| {
+        let mut command = pixi_sbom();
+        command
+            .current_dir(dir)
+            .env("PIXI_CACHE_DIR", work.path().join("empty-pkgs-cache"))
+            .env("PIXI_SBOM_CACHE_DIR", work.path().join("cache"))
+            .env("PIXI_SBOM_OFFLINE", "1")
+            .env("COLUMNS", "200")
+            .args(["-p", "linux-64"])
+            .args(args);
+        command
+    };
+    let stdout = |dir: &Path, args: &[&str]| {
+        String::from_utf8(command(dir, args).assert().success().get_output().stdout.clone()).unwrap()
+    };
+    let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/projects");
+
+    for reader in ["uv", "poetry"] {
+        let project = examples.join(reader).join("01-django");
+        // The packages report: the features that declared each package, and the count.
+        let table = stdout(&project, &["--report", "packages"]);
+        assert!(
+            table.contains("27 packages, 12 declared by the workspace"),
+            "{reader}: {table}"
+        );
+        for (name, feature) in [
+            ("django ", "default"),
+            ("django-storages", "s3"),
+            ("pytest-django", "test"),
+            ("django-debug-toolbar", "dev"),
+        ] {
+            let row = table
+                .lines()
+                .find(|l| l.starts_with(name))
+                .unwrap_or_else(|| panic!("{reader}: {name}"));
+            assert!(row.contains(feature), "{reader}: {row}");
+        }
+        assert!(
+            table
+                .lines()
+                .find(|l| l.starts_with("asgiref"))
+                .unwrap()
+                .contains(" - "),
+            "transitive"
+        );
+
+        // The phantom report reads the same declarations: django and sqlparse are imported.
+        let phantom = stdout(
+            &project,
+            &["--report", "phantom", "--source", work.path().to_str().unwrap()],
+        );
+        assert!(
+            phantom.contains("Summary: 0 phantom, 0 undeclared, 10 unused"),
+            "{reader}: {phantom}"
+        );
+
+        // The root depends on exactly what was declared.
+        let doc: Value = serde_json::from_str(&stdout(&project, &["--output", "-"])).unwrap();
+        let root = doc["dependencies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["ref"] == "root")
+            .unwrap();
+        assert_eq!(root["dependsOn"].as_array().unwrap().len(), 12, "{reader}");
+    }
+
+    // environment.yml beside conda-lock.yml: its conda specs and its pip list.
+    let conda = examples.join("conda-lock/01-django");
+    let table = stdout(&conda, &["--lockfile", "conda-lock.yml", "--report", "packages"]);
+    assert!(table.contains("66 packages, 9 declared by the workspace"), "{table}");
+    assert!(
+        table
+            .lines()
+            .find(|l| l.starts_with("django-environ"))
+            .unwrap()
+            .contains("default"),
+        "from the pip: list"
+    );
+
+    // A pixi workspace keeps its rule: declared packages plus what nothing depends on.
+    let pixi = workspace("with-pypi");
+    let doc: Value = serde_json::from_str(&stdout(pixi.path(), &["-e", "web", "--output", "-"])).unwrap();
+    let root = doc["dependencies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["ref"] == "root")
+        .unwrap();
+    let direct = doc["components"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| {
+            c["properties"]
+                .as_array()
+                .is_some_and(|ps| ps.iter().any(|p| p["name"] == "pixi:direct"))
+        })
+        .count();
+    assert!(root["dependsOn"].as_array().unwrap().len() >= direct);
+}
+
+#[test]
+fn python_extras_say_what_was_asked_for_and_what_came_with_it() {
+    // #330: `pixi:python-extras` on a package installed with extras, `pixi:via-extra` on what an
+    // extra alone brought in, from uv.lock, poetry.lock, pdm.lock and pixi.lock.
+    let work = tempfile::tempdir().unwrap();
+    let run = |dir: &Path, args: &[&str]| {
+        let output = pixi_sbom()
+            .current_dir(dir)
+            .env("PIXI_CACHE_DIR", work.path().join("empty-pkgs-cache"))
+            .env("PIXI_SBOM_CACHE_DIR", work.path().join("cache"))
+            .env("PIXI_SBOM_OFFLINE", "1")
+            .env("COLUMNS", "200")
+            .args(["-p", "linux-64"])
+            .args(args)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        String::from_utf8(output).unwrap()
+    };
+    let properties = |dir: &Path| -> std::collections::BTreeMap<String, (Option<String>, Option<String>)> {
+        let doc: Value = serde_json::from_str(&run(dir, &["--output", "-"])).unwrap();
+        doc["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| {
+                let get = |key: &str| {
+                    c["properties"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .find(|p| p["name"] == key)
+                        .map(|p| p["value"].as_str().unwrap().to_string())
+                };
+                (
+                    c["name"].as_str().unwrap().to_string(),
+                    (get("pixi:python-extras"), get("pixi:via-extra")),
+                )
+            })
+            .collect()
+    };
+    let some = |s: &str| Some(s.to_string());
+    let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/projects");
+
+    for reader in ["uv", "poetry", "pdm"] {
+        let found = properties(&examples.join(reader).join("01-django"));
+        assert_eq!(found["django"].0, some("argon2"), "{reader}");
+        assert_eq!(found["django-storages"].0, some("s3"), "{reader}");
+        for name in ["argon2-cffi", "argon2-cffi-bindings", "cffi", "pycparser"] {
+            assert_eq!(found[name].1, some("django[argon2]"), "{reader}: {name}");
+        }
+        assert_eq!(found["sqlparse"], (None, None), "{reader}: needed anyway");
+        if reader != "pdm" {
+            // pdm.lock does not say which of the project's groups are extras.
+            assert_eq!(found["django-storages"].1, some("django-example[s3]"), "{reader}");
+        }
+    }
+
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pypi-extras");
+    let found = properties(&fixture);
+    assert_eq!(found["requests"].0, some("socks"), "from the manifest's extras = [...]");
+    assert_eq!(found["pysocks"].1, some("requests[socks]"));
+    assert_eq!(found["urllib3"], (None, None));
+
+    let explained = run(&fixture, &["--explain", "pysocks", "--explain", "requests"]);
+    assert!(
+        explained
+            .lines()
+            .any(|l| l.contains("brought in by") && l.contains("requests[socks]")),
+        "{explained}"
+    );
+    assert!(
+        explained
+            .lines()
+            .any(|l| l.contains("installed with extras") && l.contains("socks")),
+        "{explained}"
+    );
+    let uv = run(&examples.join("uv/01-django"), &["--explain", "cffi"]);
+    assert!(
+        !uv.contains("none was read"),
+        "the pyproject.toml beside uv.lock was read: {uv}"
+    );
+}
+
+#[test]
+fn dependency_groups_and_extras_set_the_scope_in_every_format() {
+    // #331: what only a dependency group needs is development, what only an extra needs is
+    // optional, and the rest, shared ones included, is required; each format says so its way.
+    let work = tempfile::tempdir().unwrap();
+    let project = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/projects/uv/01-django");
+    let document = |args: &[&str]| -> Value {
+        let output = pixi_sbom()
+            .current_dir(&project)
+            .env("PIXI_CACHE_DIR", work.path().join("empty-pkgs-cache"))
+            .env("PIXI_SBOM_CACHE_DIR", work.path().join("cache"))
+            .env("PIXI_SBOM_OFFLINE", "1")
+            .args(["-p", "linux-64", "--output", "-"])
+            .args(args)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        serde_json::from_slice(&output).unwrap()
+    };
+
+    let cdx = document(&[]);
+    assert_valid(&cyclonedx_validator(), &cdx);
+    let scope = |name: &str| {
+        cdx["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == name)
+            .unwrap_or_else(|| panic!("{name}"))["scope"]
+            .clone()
+    };
+    for name in ["django", "sqlparse", "asgiref", "argon2-cffi"] {
+        assert_eq!(scope(name), "required", "{name}");
+    }
+    for name in [
+        "pytest",
+        "pluggy",
+        "django-debug-toolbar",
+        "django-storages",
+        "factory-boy",
+    ] {
+        assert_eq!(scope(name), "optional", "{name}");
+    }
+
+    let spdx = document(&["--format", "spdx"]);
+    assert_valid(&spdx_validator(), &spdx);
+    let names: std::collections::BTreeMap<&str, &str> = spdx["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| (p["SPDXID"].as_str().unwrap(), p["name"].as_str().unwrap()))
+        .collect();
+    let edges: Vec<(&str, &str, &str)> = spdx["relationships"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["relationshipType"] != "DESCRIBES")
+        .map(|r| {
+            (
+                names[r["spdxElementId"].as_str().unwrap()],
+                r["relationshipType"].as_str().unwrap(),
+                names[r["relatedSpdxElement"].as_str().unwrap()],
+            )
+        })
+        .collect();
+    assert!(edges.contains(&("pytest-django", "DEV_DEPENDENCY_OF", "django-example")));
+    assert!(edges.contains(&("django-storages", "OPTIONAL_DEPENDENCY_OF", "django-example")));
+    assert!(edges.contains(&("django-example", "DEPENDS_ON", "django")));
+    assert!(
+        edges.contains(&("pytest-django", "DEPENDS_ON", "pytest")),
+        "inside the group the edge is plain"
+    );
+
+    let spdx3 = document(&["--format", "spdx", "--spec-version", "3.0"]);
+    assert_valid(&spdx3_validator(), &spdx3);
+    let scoped: Vec<&Value> = spdx3["@graph"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|n| n["type"] == "LifecycleScopedRelationship")
+        .collect();
+    assert_eq!(scoped.len(), 1, "{scoped:?}");
+    assert_eq!(scoped[0]["scope"], "development");
+    assert_eq!(scoped[0]["to"].as_array().unwrap().len(), 3);
+
+    // pixi.lock: an environment is already a selection of features, so no scope is written.
+    let multi = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/multi-env/pixi.lock");
+    let pixi = document(&["--lockfile", multi.to_str().unwrap(), "--environment", "alpha"]);
+    assert!(
+        pixi["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c.get("scope").is_none())
+    );
+}
+
+#[test]
+fn prefix_reads_venvs_and_plain_site_packages() {
+    // #323: a venv (POSIX and Windows layouts) and a plain site-packages are environments too.
+    let work = tempfile::tempdir().unwrap();
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let run = |args: &[&str]| {
+        let mut command = pixi_sbom();
+        command
+            .current_dir(work.path())
+            .env("PIXI_CACHE_DIR", work.path().join("empty-pkgs-cache"))
+            .env("PIXI_SBOM_CACHE_DIR", work.path().join("cache"))
+            .env("PIXI_SBOM_OFFLINE", "1")
+            .args(args);
+        command
+    };
+    for (dir, platform, python, count) in [
+        ("venv-posix", "linux-64", "3.12.7", 6),
+        ("venv-windows", "win-64", "3.13.5", 2),
+        ("site-packages", "osx-arm64", "3.11", 2),
+    ] {
+        let prefix = fixtures.join(dir);
+        let output = run(&["--prefix", prefix.to_str().unwrap(), "--output", "-"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let doc: Value = serde_json::from_slice(&output).unwrap();
+        assert_valid(&cyclonedx_validator(), &doc);
+        assert_eq!(doc["components"].as_array().unwrap().len(), count, "{dir}");
+        let property = |name: &str| {
+            doc["metadata"]["properties"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["name"] == name)
+                .map(|p| p["value"].as_str().unwrap().to_string())
+        };
+        assert_eq!(property("pixi:platform").as_deref(), Some(platform), "{dir}");
+        assert_eq!(property("pixi:python-version").as_deref(), Some(python), "{dir}");
+
+        let output = run(&[
+            "--prefix",
+            prefix.to_str().unwrap(),
+            "--format",
+            "spdx",
+            "--output",
+            "-",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+        let spdx: Value = serde_json::from_slice(&output).unwrap();
+        assert_valid(&spdx_validator(), &spdx);
+    }
+
+    // The drift check: a venv against the lockfile environment it was meant to match.
+    let venv = fixtures.join("venv-posix");
+    let lockfile = fixtures.join("with-pypi/pixi.lock");
+    let output = run(&["--prefix", venv.to_str().unwrap(), "-p", "linux-64", "-e", "web"])
+        .args(["--report", "diff", "--report-format", "json", "--against"])
+        .arg(&lockfile)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&output).unwrap();
+    let changed = &report["version_changed"][0];
+    assert_eq!(changed["name"], "urllib3");
+    assert_eq!(changed["old_version"], "2.8.0");
+    assert_eq!(changed["new_version"], "2.7.0");
+    let pip: Vec<&str> = report["pip_installed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(pip, ["pip"]);
+
+    // --environment with --prefix means the lockfile side, so it needs --against.
+    run(&["--prefix", venv.to_str().unwrap(), "-e", "web"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("names the lockfile side of '--against'"));
+    run(&["--prefix", fixtures.join("explicit").to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("is not an environment"))
+        .stderr(predicate::str::contains("found"));
 }

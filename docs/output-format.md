@@ -108,7 +108,7 @@ entry).
 | `pixi:source-git`, `pixi:source-rev`, `pixi:source-tag` / `pixi:source-branch`, `pixi:source-subdirectory` | conda source (git) | The pinned build source |
 | `pixi:source-url`, `pixi:source-subdirectory` | conda source (archive) | The pinned build source; its SHA-256 goes into the hashes |
 | `pixi:source-path` | conda source (path) | Local path |
-| `pixi:direct` | any | `true` when the workspace manifest declares this package itself, rather than it coming along as somebody else's dependency |
+| `pixi:direct` | any | `true` when the workspace manifest declares this package itself, rather than it coming along as somebody else's dependency. For a lockfile other than `pixi.lock`, the manifest is the `pyproject.toml` or `environment.yml` beside it (see [What a project without pixi declared](cli.md#what-a-project-without-pixi-declared)) |
 | `pixi:declared-in` | any | The features whose dependency tables declare it, comma separated (`default`, `default,docs`) |
 | `pixi:license-exempt` | any | Why the license policy does not apply (`--ignore-license`); `true` when no justification was given |
 | `pixi:scorecard`, `pixi:scorecard-date` | any | With `--scorecard`: the OpenSSF Scorecard aggregate out of ten and when the repository was scored |
@@ -121,6 +121,8 @@ entry).
 | `pixi:source-rev` | PyPI (`pylock.toml`, `uv.lock`, `--prefix`) | The exact commit of a VCS source |
 | `pixi:editable` | PyPI (`pylock.toml`, `uv.lock`) | `true` for a local directory installed in editable mode |
 | `pixi:requires-python` | PyPI | `Requires-Python` of the distribution |
+| `pixi:python-extras` | PyPI (`pixi.lock`, `uv.lock`, `poetry.lock`, `pdm.lock`) | The extras the package was installed with, comma separated, e.g. `socks,security`: what the manifest and the other packages asked of it |
+| `pixi:via-extra` | PyPI (`pixi.lock`, `uv.lock`, `poetry.lock`, `pdm.lock`, `pylock.toml`) | The extras the package is in the document for, as `package[extra]`, comma separated, e.g. `requests[socks]`. Set only when nothing else needs the package; what such a package depends on carries the same label |
 | `pixi:source` | PyPI | `true` for sdists / source trees |
 
 In SPDX these appear in the package `comment` because SPDX 2.3 has no free-form property field.
@@ -271,7 +273,8 @@ With `--prefix` the document describes an installed environment instead of a loc
 says `prefix <name>`, and pip-installed packages are located by a `file://` URL of their `dist-info` directory (or
 `<vcs>+<url>` for direct VCS installs, with `pixi:direct-url` and `pixi:source-rev`), carry `pixi:installer`, and
 have no hashes. Conda packages carry `pixi:extracted-package-dir`, where the record says the archive was
-unpacked.
+unpacked. A venv or a plain Python installation has no `python` package to list, so the Python it was made with is
+the document's `pixi:python-version` (a CycloneDX metadata property, a line of the SPDX root package's comment).
 
 ### Documents derived from documents
 
@@ -334,13 +337,36 @@ to the graph instead of floating as extra roots.
 | | CycloneDX | SPDX |
 |---|---|---|
 | Package → package | `dependencies[]`: `{ ref, dependsOn[] }` for every component | `DEPENDS_ON` relationship per edge |
-| Root → packages | `dependencies[0]` (`ref: root`) lists what the workspace declared, plus the packages nothing else depends on | `SPDXRef-Package-root DEPENDS_ON ...` for the same set |
+| Root → packages | `dependencies[0]` (`ref: root`) lists what the workspace declared, plus the packages nothing else depends on; beside a lockfile that is not `pixi.lock`, with a manifest that declares something, only what it declared | `SPDXRef-Package-root DEPENDS_ON ...` for the same set |
 
 The declared half comes from the manifest next to the lockfile: the dependency tables of the environment's features
 (see [`pixi:direct`](#pixi-properties)), so a declared dependency that something else also needs — `python` is
 the usual example — is on the root where it belongs. The other half is the graph-root heuristic: packages nothing
 else depends on. Without a readable manifest (`--prefix`, a lockfile on its own) the heuristic is the whole answer,
 and nothing is marked direct.
+
+### Runtime, development and optional
+
+When the input tells what the project needs to run apart from what it needs for development or an extra, each
+format says so in its own field. Everything reachable from the default dependencies is required, shared packages
+included. What only a dependency group reaches is for development, and what only one of the project's extras
+reaches is optional; a package both reach counts as optional.
+
+| | CycloneDX | SPDX 2.3 | SPDX 3.0.1 |
+|---|---|---|---|
+| Required | `scope: required` | `DEPENDS_ON` | `dependsOn` |
+| Development | `scope: optional` | `<package> DEV_DEPENDENCY_OF <dependent>` | `LifecycleScopedRelationship`, `dependsOn`, `scope: development` |
+| Optional | `scope: optional` | `<package> OPTIONAL_DEPENDENCY_OF <dependent>` | `dependsOn` (3.0.1 has no optional scope) |
+
+The SPDX edges change only where the graph crosses from what is required into a group or extra, usually at the
+root: `pytest DEV_DEPENDENCY_OF my-app`. Inside a group the edges stay `DEPENDS_ON` (`pytest` depends on `pluggy`).
+`pixi:declared-in` still names the group or extra.
+
+The scopes come from the manifest beside a lockfile other than `pixi.lock`, when it declares dependency groups or
+extras (see [What a project without pixi declared](cli.md#what-a-project-without-pixi-declared)), and from the
+categories of a `conda-lock.yml` when there are others than `main` (`dev` is development, any other optional). A
+`pixi.lock` environment is already one selection of features, so its documents carry no scope, and neither does an
+input with nothing to tell apart.
 
 ## Vulnerabilities
 

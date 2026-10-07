@@ -46,6 +46,7 @@ pub mod embedded;
 #[doc(hidden)]
 pub mod explain;
 pub mod explicit;
+pub mod extras;
 #[doc(hidden)]
 pub mod filter;
 #[doc(hidden)]
@@ -95,6 +96,7 @@ pub mod pyversion;
 #[doc(hidden)]
 pub mod report;
 #[doc(hidden)]
+pub mod scope;
 pub mod scorecard;
 #[doc(hidden)]
 pub mod stdlib;
