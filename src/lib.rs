@@ -30,6 +30,7 @@ pub mod cli;
 pub mod concurrency;
 #[doc(hidden)]
 pub mod condaarchive;
+pub mod condalock;
 #[doc(hidden)]
 pub mod config;
 #[doc(hidden)]
@@ -44,6 +45,7 @@ pub mod doctor;
 pub mod embedded;
 #[doc(hidden)]
 pub mod explain;
+pub mod explicit;
 #[doc(hidden)]
 pub mod filter;
 #[doc(hidden)]
@@ -72,6 +74,7 @@ pub mod osv;
 #[doc(hidden)]
 pub mod outdated;
 #[doc(hidden)]
+pub mod pdm;
 pub mod phantom;
 #[doc(hidden)]
 pub mod pkgcache;

@@ -172,7 +172,7 @@ fn no_lockfile_in_tree_fails_with_help() {
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "no pixi.lock, uv.lock, poetry.lock or pylock.toml found",
+            "no pixi.lock, uv.lock, poetry.lock, pdm.lock or pylock.toml found",
         ))
         .stderr(predicate::str::contains("--lockfile"));
 }
@@ -6918,4 +6918,415 @@ fn poetry_lock_is_read_in_every_format_with_its_sources() {
         .code(1)
         .stderr(predicate::str::contains("lock-version 1.1 is not supported"))
         .stderr(predicate::str::contains("poetry lock"));
+}
+
+#[test]
+fn pdm_lock_is_read_in_every_format_with_extras_folded_in() {
+    // #325: pdm.lock 4.x, as current PDM writes it for a project with groups, an extra, a git
+    // dependency and an editable path.
+    let work = tempfile::tempdir().unwrap();
+    let command = |dir: &Path, args: &[&str]| {
+        let mut command = pixi_sbom();
+        command
+            .current_dir(dir)
+            .env("PIXI_CACHE_DIR", work.path().join("empty-pkgs-cache"))
+            .env("PIXI_SBOM_CACHE_DIR", work.path().join("cache"))
+            .env("PIXI_SBOM_OFFLINE", "1")
+            .args(args);
+        command
+    };
+    let doc = |dir: &Path, args: &[&str]| -> Value {
+        let mut all = vec!["--output", "-"];
+        all.extend_from_slice(args);
+        serde_json::from_slice(&command(dir, &all).assert().success().get_output().stdout).unwrap()
+    };
+    let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/projects");
+    let django = examples.join("pdm/01-django");
+
+    let linux = doc(&django, &["-p", "linux-64"]);
+    assert_valid(&cyclonedx_validator(), &linux);
+    assert_valid(
+        &cyclonedx_1_7_validator(),
+        &doc(&django, &["-p", "linux-64", "--spec-version", "1.7"]),
+    );
+    assert_valid(
+        &spdx_validator(),
+        &doc(&django, &["-p", "linux-64", "--format", "spdx"]),
+    );
+    assert_valid(
+        &spdx3_validator(),
+        &doc(
+            &django,
+            &["-p", "linux-64", "--format", "spdx", "--spec-version", "3.0"],
+        ),
+    );
+    let props = linux["metadata"]["properties"].as_array().unwrap();
+    assert!(
+        props
+            .iter()
+            .any(|p| p["name"] == "pixi:lockfile" && p["value"] == "pdm.lock")
+    );
+
+    let components = linux["components"].as_array().unwrap();
+    // django[argon2] is a second entry in the lock; it is one component, with argon2-cffi under it.
+    assert_eq!(components.iter().filter(|c| c["name"] == "django").count(), 1);
+    let django_ref = components.iter().find(|c| c["name"] == "django").unwrap()["bom-ref"].clone();
+    let depends_on = linux["dependencies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["ref"] == django_ref)
+        .unwrap()["dependsOn"]
+        .clone();
+    assert!(
+        depends_on
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d.as_str().unwrap().contains("argon2-cffi")),
+        "{depends_on}"
+    );
+    let property = |name: &str, key: &str| {
+        components.iter().find(|c| c["name"] == name).unwrap()["properties"]
+            .as_array()
+            .and_then(|ps| ps.iter().find(|p| p["name"] == key))
+            .map(|p| p["value"].as_str().unwrap().to_string())
+    };
+    assert!(property("django-debug-toolbar", "pixi:source-rev").is_some_and(|r| r.len() == 40));
+    assert_eq!(
+        property("internal-utils", "pixi:direct-url").as_deref(),
+        Some("libs/internal-utils")
+    );
+
+    // PDM and uv resolved this scenario independently; they agree on what is installed.
+    let names = |d: &Value| -> std::collections::BTreeSet<String> {
+        d["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["name"].as_str().unwrap().to_lowercase())
+            .collect()
+    };
+    for platform in ["linux-64", "win-64"] {
+        assert_eq!(
+            names(&doc(&django, &["-p", platform])),
+            names(&doc(&examples.join("uv/01-django"), &["-p", platform])),
+            "{platform}"
+        );
+    }
+
+    for report in [
+        &["--report", "packages"][..],
+        &["--report", "licenses"],
+        &["--vulnerabilities", "osv", "--report", "vulnerabilities"],
+    ] {
+        command(&django, &[&["-p", "linux-64"][..], report].concat())
+            .assert()
+            .success();
+    }
+
+    let old = work.path().join("old");
+    std::fs::create_dir_all(&old).unwrap();
+    std::fs::write(old.join("pdm.lock"), "[metadata]\nlock_version = \"3.0\"\n").unwrap();
+    command(&old, &["--output", "-"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("lock_version 3.0 is not supported"));
+}
+
+#[test]
+fn conda_lock_gives_the_same_conda_components_as_pixi_lock_and_one_document_per_platform() {
+    // #326: conda-lock.yml (unified, version 1).
+    let work = tempfile::tempdir().unwrap();
+    let command = |dir: &Path, args: &[&str]| {
+        let mut command = pixi_sbom();
+        command
+            .current_dir(dir)
+            .env("PIXI_CACHE_DIR", work.path().join("empty-pkgs-cache"))
+            .env("PIXI_SBOM_CACHE_DIR", work.path().join("cache"))
+            .env("PIXI_SBOM_OFFLINE", "1")
+            .args(args);
+        command
+    };
+    let doc = |dir: &Path, args: &[&str]| -> Value {
+        let mut all = vec!["--output", "-"];
+        all.extend_from_slice(args);
+        serde_json::from_slice(&command(dir, &all).assert().success().get_output().stdout).unwrap()
+    };
+    let component = |d: &Value, name: &str| -> Value {
+        d["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == name)
+            .cloned()
+            .unwrap_or_else(|| panic!("{name}"))
+    };
+
+    // The exact python archive tests/fixtures/with-pypi/pixi.lock pins, as conda-lock writes it.
+    let same = work.path().join("same");
+    std::fs::create_dir_all(&same).unwrap();
+    std::fs::write(
+        same.join("conda-lock.yml"),
+        r#"version: 1
+metadata:
+  content_hash: {linux-64: x}
+  channels: [{url: conda-forge, used_env_vars: []}]
+  platforms: [linux-64]
+  sources: [environment.yml]
+package:
+- name: python
+  version: 3.12.14
+  manager: conda
+  platform: linux-64
+  dependencies: {}
+  url: https://conda.anaconda.org/conda-forge/linux-64/python-3.12.14-h5f976f7_3_cpython.conda
+  hash: {md5: 98be3cf76eca2e8871f907a03aed3b84, sha256: 14c579b1016da04e4c9f1c5c857272d83ec447317d8c4074a07d59de3cef70ef}
+  category: main
+  optional: false
+"#,
+    )
+    .unwrap();
+    let from_conda_lock = component(
+        &doc(&same, &["--lockfile", "conda-lock.yml", "-p", "linux-64"]),
+        "python",
+    );
+    let from_pixi_lock = component(
+        &doc(
+            workspace("with-pypi").path(),
+            &[
+                "--lockfile",
+                tests_dir().join("fixtures/with-pypi/pixi.lock").to_str().unwrap(),
+                "-e",
+                "web",
+                "-p",
+                "linux-64",
+            ],
+        ),
+        "python",
+    );
+    for field in ["purl", "supplier", "hashes", "externalReferences"] {
+        assert_eq!(from_conda_lock[field], from_pixi_lock[field], "{field}");
+    }
+
+    // A real conda-lock.yml with conda and pip packages on two platforms.
+    let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/projects/conda-lock/01-django");
+    let linux = doc(&example, &["--lockfile", "conda-lock.yml", "-p", "linux-64"]);
+    assert_valid(&cyclonedx_validator(), &linux);
+    assert_valid(
+        &cyclonedx_1_7_validator(),
+        &doc(
+            &example,
+            &[
+                "--lockfile",
+                "conda-lock.yml",
+                "-p",
+                "linux-64",
+                "--spec-version",
+                "1.7",
+            ],
+        ),
+    );
+    assert_valid(
+        &spdx_validator(),
+        &doc(
+            &example,
+            &["--lockfile", "conda-lock.yml", "-p", "linux-64", "--format", "spdx"],
+        ),
+    );
+    assert_valid(
+        &spdx3_validator(),
+        &doc(
+            &example,
+            &[
+                "--lockfile",
+                "conda-lock.yml",
+                "-p",
+                "linux-64",
+                "--format",
+                "spdx",
+                "--spec-version",
+                "3.0",
+            ],
+        ),
+    );
+    assert!(
+        component(&linux, "django")["purl"]
+            .as_str()
+            .unwrap()
+            .starts_with("pkg:conda/django@3.2.12")
+    );
+    assert_eq!(
+        component(&linux, "django-environ")["purl"],
+        "pkg:pypi/django-environ@0.9.0",
+        "the pip section"
+    );
+    let mac = doc(&example, &["--lockfile", "conda-lock.yml", "-p", "osx-arm64"]);
+    assert!(
+        component(&mac, "python")["purl"]
+            .as_str()
+            .unwrap()
+            .contains("subdir=osx-arm64")
+    );
+
+    // --all-platforms writes one document per locked platform.
+    let out = work.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    command(
+        &example,
+        &[
+            "--lockfile",
+            "conda-lock.yml",
+            "--all-platforms",
+            "--output",
+            out.to_str().unwrap(),
+        ],
+    )
+    .assert()
+    .success();
+    let mut written: Vec<String> = std::fs::read_dir(&out)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    written.sort();
+    assert_eq!(written, ["sbom-linux-64.cdx.json", "sbom-osx-arm64.cdx.json"]);
+
+    // Reports run; environments and unknown platforms are refused.
+    for report in [&["--report", "packages"][..], &["--report", "licenses"]] {
+        command(
+            &example,
+            &[&["--lockfile", "conda-lock.yml", "-p", "linux-64"][..], report].concat(),
+        )
+        .assert()
+        .success();
+    }
+    command(
+        &example,
+        &["--lockfile", "conda-lock.yml", "--all-environments", "--output", "-"],
+    )
+    .assert()
+    .code(2)
+    .stderr(predicate::str::contains("conda-lock.yml has none"));
+    command(
+        &example,
+        &["--lockfile", "conda-lock.yml", "-p", "win-64", "--output", "-"],
+    )
+    .assert()
+    .code(1)
+    .stderr(predicate::str::contains(
+        "platform win-64 is not in this conda-lock.yml",
+    ));
+}
+
+#[test]
+fn explicit_spec_files_are_read_with_whatever_hashes_they_carry() {
+    // #327: `conda list --explicit` output, recognised by its @EXPLICIT line.
+    let work = tempfile::tempdir().unwrap();
+    let command = |file: &Path, args: &[&str]| {
+        let mut command = pixi_sbom();
+        command
+            .current_dir(work.path())
+            .env("PIXI_CACHE_DIR", work.path().join("empty-pkgs-cache"))
+            .env("PIXI_SBOM_CACHE_DIR", work.path().join("cache"))
+            .env("PIXI_SBOM_OFFLINE", "1")
+            .arg("--lockfile")
+            .arg(file)
+            .args(args);
+        command
+    };
+    let doc = |file: &Path, args: &[&str]| -> Value {
+        let mut all = vec!["--output", "-"];
+        all.extend_from_slice(args);
+        serde_json::from_slice(&command(file, &all).assert().success().get_output().stdout).unwrap()
+    };
+    let fixtures = tests_dir().join("fixtures/explicit");
+    let by_purl = |d: &Value| -> std::collections::BTreeMap<String, Value> {
+        d["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| (c["purl"].as_str().unwrap().to_string(), c["hashes"].clone()))
+            .collect()
+    };
+    let alg = |hashes: &Value| -> Vec<String> {
+        hashes
+            .as_array()
+            .map(|h| h.iter().map(|x| x["alg"].as_str().unwrap().to_string()).collect())
+            .unwrap_or_default()
+    };
+
+    let md5 = doc(&fixtures.join("md5.txt"), &[]);
+    assert_valid(&cyclonedx_validator(), &md5);
+    assert_valid(
+        &cyclonedx_1_7_validator(),
+        &doc(&fixtures.join("md5.txt"), &["--spec-version", "1.7"]),
+    );
+    assert_valid(
+        &spdx_validator(),
+        &doc(&fixtures.join("md5.txt"), &["--format", "spdx"]),
+    );
+    assert_valid(
+        &spdx3_validator(),
+        &doc(
+            &fixtures.join("md5.txt"),
+            &["--format", "spdx", "--spec-version", "3.0"],
+        ),
+    );
+    let props = md5["metadata"]["properties"].as_array().unwrap();
+    assert!(
+        props
+            .iter()
+            .any(|p| p["name"] == "pixi:platform" && p["value"] == "linux-64"),
+        "from the # platform: comment"
+    );
+
+    // The same 65 packages whichever hashes the file carries.
+    let (with_md5, with_sha, without) = (
+        by_purl(&md5),
+        by_purl(&doc(&fixtures.join("sha256.txt"), &[])),
+        by_purl(&doc(&fixtures.join("no-hashes.txt"), &[])),
+    );
+    assert_eq!(with_md5.len(), 65);
+    assert_eq!(with_md5.keys().collect::<Vec<_>>(), with_sha.keys().collect::<Vec<_>>());
+    assert_eq!(with_md5.keys().collect::<Vec<_>>(), without.keys().collect::<Vec<_>>());
+    assert!(with_md5.values().all(|h| alg(h) == ["MD5"]));
+    assert!(with_sha.values().all(|h| alg(h) == ["SHA-256"]));
+    assert!(without.values().all(|h| alg(h).is_empty()));
+
+    // The format has no graph: every package hangs off the root and nothing else.
+    let deps = md5["dependencies"].as_array().unwrap();
+    assert!(
+        deps.iter()
+            .filter(|d| d["ref"] != "root")
+            .all(|d| d["dependsOn"].as_array().is_none_or(|a| a.is_empty()))
+    );
+
+    // The conda-lock.yml it was rendered from gives the same conda components.
+    let lock = doc(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/projects/conda-lock/01-django/conda-lock.yml"),
+        &["-p", "linux-64"],
+    );
+    let conda_from_lock: std::collections::BTreeSet<String> = by_purl(&lock)
+        .into_keys()
+        .filter(|p| p.starts_with("pkg:conda/"))
+        .collect();
+    let conda_from_explicit: std::collections::BTreeSet<String> = with_md5.into_keys().collect();
+    assert_eq!(conda_from_explicit, conda_from_lock);
+
+    // A platform the file is not for, and a file that is not explicit after all.
+    command(&fixtures.join("md5.txt"), &["-p", "win-64", "--output", "-"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("is for linux-64, not win-64"));
+    let unpinned = work.path().join("environment.txt");
+    std::fs::write(&unpinned, "@EXPLICIT\nnumpy=2.0\n").unwrap();
+    command(&unpinned, &["--output", "-"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("line 2"))
+        .stderr(predicate::str::contains("is not a package URL"));
+    command(&fixtures.join("md5.txt"), &["--all-platforms", "--output", "-"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("an explicit spec file has none"));
 }
