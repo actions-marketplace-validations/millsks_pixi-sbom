@@ -287,3 +287,168 @@ jobs:
     with:
       tag: ${{ needs.tag.outputs.tag }}
     secrets: inherit
+
+  # ---------------------------------------------------------------------------
+  # The same binary as platform wheels for PyPI (maturin, `bindings = "bin"`), so `uvx pixi-sbom`
+  # and `pip install pixi-sbom` work for projects that do not use pixi. Built from the tagged
+  # commit with the toolchain the archives use, and attested like them.
+  # ---------------------------------------------------------------------------
+  wheels:
+    name: Wheel (${{ matrix.platform }})
+    needs: tag
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, platform: manylinux-x86_64, target: x86_64-unknown-linux-gnu, manylinux: auto, run: true }
+          - { os: ubuntu-24.04-arm, platform: manylinux-aarch64, target: aarch64-unknown-linux-gnu, manylinux: auto, run: true }
+          - { os: ubuntu-latest, platform: musllinux-x86_64, target: x86_64-unknown-linux-musl, manylinux: musllinux_1_2, run: false }
+          - { os: ubuntu-24.04-arm, platform: musllinux-aarch64, target: aarch64-unknown-linux-musl, manylinux: musllinux_1_2, run: false }
+          - { os: macos-15-intel, platform: macos-x86_64, target: x86_64-apple-darwin, manylinux: "off", run: true }
+          - { os: macos-latest, platform: macos-arm64, target: aarch64-apple-darwin, manylinux: "off", run: true }
+          - { os: windows-latest, platform: windows-x86_64, target: x86_64-pc-windows-msvc, manylinux: "off", run: true }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.tag.outputs.tag }}
+      - name: Build the wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          maturin-version: v1.15.0
+          # The Rust that pixi.toml pins for the release archives.
+          rust-toolchain: "1.98.1"
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --locked --out dist
+      # A musllinux wheel cannot run on the glibc runner; the others are installed and run.
+      - uses: actions/setup-python@v5
+        if: matrix.run
+        with:
+          python-version: "3.13"
+      - name: Smoke test
+        if: matrix.run
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv smoke
+          if [[ -d smoke/Scripts ]]; then bin=smoke/Scripts; else bin=smoke/bin; fi
+          "$bin/python" -m pip install --no-index --find-links dist pixi-sbom
+          "$bin/pixi-sbom" --version
+      - name: Attest the wheel's provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*.whl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.platform }}
+          path: dist/*.whl
+
+  # Trusted publishing: no token, PyPI checks this workflow's OIDC identity against the
+  # publisher registered for the project (repository millsks/pixi-sbom, workflow
+  # release-artifacts.yml, and the environment named here). A release candidate goes to
+  # TestPyPI, a final release to PyPI, and either only once the GitHub Release is out.
+  testpypi:
+    name: Publish the wheels to TestPyPI
+    needs: [tag, wheels, publish]
+    if: needs.tag.outputs.prerelease == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/project/pixi-sbom/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          # The digital attestations PyPI shows beside each file.
+          attestations: true
+          # A re-run (workflow_dispatch) finds the files already there; PyPI never takes a
+          # version twice, so there is nothing to replace.
+          skip-existing: true
+
+  pypi:
+    name: Publish the wheels to PyPI
+    needs: [tag, wheels, publish]
+    if: needs.tag.outputs.prerelease == 'false'
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/pixi-sbom/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          attestations: true
+          skip-existing: true
+
+  # The pre-commit hooks live in a mirror repository, millsks/pixi-sbom-pre-commit, the way ruff's
+  # do: pre-commit installs a `language: python` hook by `pip install .` of the hook repository,
+  # which here would compile pixi-sbom from Rust. The mirror holds only the hooks and a
+  # pyproject.toml pinning the wheel of the same version, rendered from pre-commit-mirror/ and
+  # tagged once that wheel is on PyPI. The release App must be installed on the mirror repository.
+  pre-commit-mirror:
+    name: Update the pre-commit mirror
+    needs: [tag, pypi]
+    if: needs.tag.outputs.prerelease == 'false'
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.tag.outputs.tag }}
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: pixi-sbom-pre-commit
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.tag.outputs.tag }}
+          path: source
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/pixi-sbom-pre-commit
+          token: ${{ steps.app-token.outputs.token }}
+          path: mirror
+      - name: Render, commit and tag
+        working-directory: mirror
+        run: |
+          set -euo pipefail
+          ../source/pre-commit-mirror/render.sh "${TAG#v}" .
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "::notice::the mirror already has ${TAG}"
+          else
+            git commit -m "chore: pixi-sbom ${TAG}"
+          fi
+          if git rev-parse -q --verify "refs/tags/${TAG}" > /dev/null; then
+            echo "::notice::the mirror is already tagged ${TAG}"
+          else
+            git tag "${TAG}"
+          fi
+          git push origin HEAD "refs/tags/${TAG}"
+          {
+            echo "### pre-commit mirror"
+            echo
+            echo "\`millsks/pixi-sbom-pre-commit\` is at \`${TAG}\`: \`rev: ${TAG}\` installs the wheel of the same version."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -237,6 +237,7 @@ release containing them exists; keep `action.yml` inputs and the CLI in step at 
 | Build | same three | `pixi run build` and `--version` smoke test |
 | Docs | ubuntu | `pixi run docs-build`: the site must build with `--strict` |
 | SBOM via action | all five release platforms | The repository's own action against its own lockfile; SARIF and the attestation from the linux-64 leg only. See [The GitHub Action](#the-github-action) |
+| Action on a uv project, without pixi | ubuntu-latest | The action on `examples/projects/uv/01-django/uv.lock` and on a venv built in the job (`prefix`), on a runner with no pixi; refuses `lockfile` with `prefix`. It runs the head binary, built by `action-head-binary` and placed where the action reuses an install, so it tests what the next release does rather than what the last one did |
 
 `.github/workflows/supply-chain.yml` runs that same dependency check on a schedule (Mondays, and on demand).
 The per-pull-request run cannot see an advisory published after a merge, and the weekly one is what catches it:
@@ -352,6 +353,36 @@ What the two do, in order:
    tag out clean and runs `cargo publish --locked` (skipped with a warning while the `CARGO_REGISTRY_TOKEN` secret
    is missing). The `[package.metadata.binstall]` table in `Cargo.toml` points `cargo binstall` at the release
    archives.
+9. **Wheels.** The `wheels` job builds the same binary into PyPI platform wheels with
+   [maturin](https://www.maturin.rs/) (`pyproject.toml`, `bindings = "bin"`: no Python code, version from
+   `Cargo.toml`, so `1.7.0-rc.1` becomes `1.7.0rc1`), from the tag, with the Rust `pixi.toml` pins: manylinux and
+   musllinux for x86_64 and aarch64, macOS x86_64 and arm64, Windows x86_64. Each is installed into a fresh venv and
+   run (except musllinux, which the glibc runner cannot run) and attested like the archives. Once the GitHub release
+   is out, a release candidate's wheels go to **TestPyPI** (`testpypi` job) and a final release's to **PyPI**
+   (`pypi` job), through trusted publishing: no token, PyPI checks the run's OIDC identity. There is no sdist,
+   which would need a Rust toolchain and the crates.io index at install time.
+
+10. **pre-commit mirror.** After a final release's wheels are on PyPI, the `pre-commit-mirror` job renders
+    `pre-commit-mirror/` (the hooks, and a `pyproject.toml` pinning `pixi-sbom==X.Y.Z`) into
+    [`millsks/pixi-sbom-pre-commit`](https://github.com/millsks/pixi-sbom-pre-commit), commits and tags it `vX.Y.Z`.
+    The hooks cannot live here: pre-commit installs a `language: python` hook by `pip install .` of its repository,
+    which here would compile the binary. The mirror repository must exist with the release GitHub App installed on
+    it. To try the hooks before a release: `pre-commit-mirror/render.sh 1.7.0 /tmp/mirror`, commit that in a git
+    repository, and `PIP_FIND_LINKS=<dir with a locally built wheel> pre-commit try-repo /tmp/mirror pixi-sbom` in a
+    project.
+
+**PyPI's side of trusted publishing** is set up once per index, by the maintainer, under the project's
+*Publishing* settings (or as a *pending publisher* before the first upload creates the project):
+
+| Field | PyPI | TestPyPI |
+|---|---|---|
+| Project name | `pixi-sbom` | `pixi-sbom` |
+| Owner / repository | `millsks` / `pixi-sbom` | `millsks` / `pixi-sbom` |
+| Workflow | `release-artifacts.yml` | `release-artifacts.yml` |
+| Environment | `pypi` | `testpypi` |
+
+The two GitHub environments of the same names are created on the first run that uses them; a required reviewer on
+`pypi` turns the final upload into a click.
 
 **Why the split exists.** `actions/attest-build-provenance` signs the OIDC identity of the run it is in, and that
 identity comes from the event, not from what the job checked out. While the build lived in the `workflow_dispatch`
@@ -367,7 +398,8 @@ This works because the tag is pushed with the release GitHub App's token. A push
 handover check fails the release rather than letting it end quietly with nothing built, and
 `release-artifacts.yml` can be dispatched by hand with a `tag` input.
 
-**What is not attested, and why.** The crates.io publish is not: crates.io has no attestation verification, so a
+**What is not attested, and why.** The wheels are attested twice over: the build provenance above, and the
+publish attestations PyPI shows beside each file. The crates.io publish is not: crates.io has no attestation verification, so a
 statement about the uploaded `.crate` would be one nobody could check at install time, and `cargo install` builds
 from source anyway. Neither is the conda-forge package: the feedstock builds on conda-forge's own infrastructure
 from the source tarball, so any provenance there is theirs to make, not ours. What is attested is the set of
