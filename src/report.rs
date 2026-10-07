@@ -2895,6 +2895,8 @@ mod tests {
                 ],
                 analysis: Some(crate::model::Analysis {
                     state: "false_positive",
+                    justification: None,
+                    response: vec![],
                     detail: Some("not the same zlib".into()),
                 }),
                 kev: None,

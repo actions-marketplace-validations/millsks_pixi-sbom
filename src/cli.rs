@@ -510,17 +510,19 @@ pub struct Args {
     #[arg(long, value_enum, value_name = "SEVERITY")]
     pub fail_on_severity: Option<FailOnSeverity>,
 
-    /// Accept a finding deliberately (repeatable): `ID`, `ID:justification` or
-    /// `ID:state:justification`, where ID is an advisory id or alias (GHSA, CVE, ...) and state
-    /// a CycloneDX analysis state (default `not_affected`). The finding stays in the document
+    /// Accept a finding deliberately (repeatable): `ID`, `ID:text` or
+    /// `ID:state[:justification][:response,...][:text]`, where ID is an advisory id or alias
+    /// (GHSA, CVE, ...), state a CycloneDX analysis state (default `not_affected`), justification a
+    /// CycloneDX impact-analysis justification (`code_not_reachable`, ..., only after
+    /// `not_affected`) and response a list of CycloneDX responses (`update`, `will_not_fix`, ...). The finding stays in the document
     /// with an `analysis` block, is excluded from --fail-on-severity and listed separately in
     /// the report. Requires --vulnerabilities.
     #[arg(long, value_name = "ID[:STATE][:TEXT]")]
     pub ignore_vuln: Vec<String>,
 
     /// Also write a standalone CycloneDX VEX document here: every finding with its analysis,
-    /// linked back to the SBOM this run writes. Needs --vulnerabilities, and a single
-    /// document.
+    /// linked back to the SBOM this run writes. Needs --vulnerabilities, a single document, and
+    /// CycloneDX output.
     #[arg(long, value_name = "PATH")]
     pub vex: Option<PathBuf>,
 

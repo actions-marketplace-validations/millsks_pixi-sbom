@@ -20,6 +20,28 @@ const STATES: [&str; 6] = [
     "not_affected",
 ];
 
+/// The CycloneDX impact-analysis justifications `--ignore-vuln` accepts after `not_affected`.
+pub const JUSTIFICATIONS: [&str; 9] = [
+    "code_not_present",
+    "code_not_reachable",
+    "requires_configuration",
+    "requires_dependency",
+    "requires_environment",
+    "protected_by_compiler",
+    "protected_at_runtime",
+    "protected_at_perimeter",
+    "protected_by_mitigating_control",
+];
+
+/// The CycloneDX impact-analysis responses `--ignore-vuln` accepts after a state.
+pub const RESPONSES: [&str; 5] = [
+    "can_not_fix",
+    "will_not_fix",
+    "update",
+    "rollback",
+    "workaround_available",
+];
+
 /// One `--ignore-vuln` entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ignore {
@@ -27,13 +49,18 @@ pub struct Ignore {
     pub id: String,
     /// Analysis state, one of the CycloneDX states.
     pub state: &'static str,
+    /// Machine-readable reason, one of [`JUSTIFICATIONS`]; only with `not_affected`.
+    pub justification: Option<&'static str>,
+    /// What is being done about it, from [`RESPONSES`]; empty when not given.
+    pub response: Vec<&'static str>,
     /// Free-text justification, when given.
     pub detail: Option<String>,
 }
 
 impl Ignore {
-    /// Parse `ID`, `ID:detail` or `ID:state:detail`; the second segment is a state only when it
-    /// names one, otherwise it is the detail.
+    /// Parse `ID`, `ID:detail` or `ID:state[:justification][:response,...][:detail]`; a segment is
+    /// a state, a justification or a response list only when it names known values, otherwise it
+    /// starts the detail.
     pub fn parse(text: &str) -> Result<Self, String> {
         let text = text.trim();
         let (id, rest) = match text.split_once(':') {
@@ -43,26 +70,48 @@ impl Ignore {
         if id.is_empty() {
             return Err(format!("'{text}' has no vulnerability id"));
         }
-        let (state, detail) = match rest {
-            None | Some("") => (DEFAULT_STATE, None),
+        let known = |list: &[&'static str], word: &str| list.iter().find(|w| **w == word.trim()).copied();
+        let trimmed = |text: &str| Some(text.trim()).filter(|t| !t.is_empty()).map(str::to_string);
+        let (state, justification, response, detail) = match rest {
+            None | Some("") => (DEFAULT_STATE, None, Vec::new(), None),
             Some(rest) => match rest.split_once(':') {
-                Some((state, detail)) if STATES.contains(&state.trim()) => {
-                    let state = STATES
-                        .iter()
-                        .find(|s| **s == state.trim())
-                        .copied()
-                        .unwrap_or(DEFAULT_STATE);
-                    (state, Some(detail.trim()).filter(|d| !d.is_empty()).map(str::to_string))
+                // Only after an explicit state may a justification or a response follow.
+                Some((state, mut after)) if known(&STATES, state).is_some() => {
+                    let state = known(&STATES, state).unwrap_or(DEFAULT_STATE);
+                    let (head, tail) = after.split_once(':').unwrap_or((after, ""));
+                    let justification = known(&JUSTIFICATIONS, head);
+                    if justification.is_some() {
+                        after = tail;
+                    }
+                    let (head, tail) = after.split_once(':').unwrap_or((after, ""));
+                    let response: Option<Vec<&'static str>> =
+                        head.split(',').map(|word| known(&RESPONSES, word)).collect();
+                    let mut response = response.unwrap_or_default();
+                    if !response.is_empty() {
+                        after = tail;
+                        let mut seen = std::collections::HashSet::new();
+                        response.retain(|r| seen.insert(*r));
+                    }
+                    (state, justification, response, trimmed(after))
                 }
-                _ => match STATES.iter().find(|s| **s == rest) {
-                    Some(state) => (*state, None),
-                    None => (DEFAULT_STATE, Some(rest.to_string())),
+                _ => match known(&STATES, rest) {
+                    Some(state) => (state, None, Vec::new(), None),
+                    None => (DEFAULT_STATE, None, Vec::new(), Some(rest.to_string())),
                 },
             },
         };
+        if let Some(justification) = justification
+            && state != "not_affected"
+        {
+            return Err(format!(
+                "'{text}': a justification ('{justification}') only applies to the not_affected state, not {state}"
+            ));
+        }
         Ok(Self {
             id: id.to_string(),
             state,
+            justification,
+            response,
             detail,
         })
     }
@@ -108,6 +157,8 @@ pub fn apply_ignores(sbom: &mut Sbom, ignores: &[Ignore]) -> usize {
         for vuln in sbom.vulnerabilities.iter_mut().filter(|v| ignore.matches(v)) {
             vuln.analysis = Some(Analysis {
                 state: ignore.state,
+                justification: ignore.justification,
+                response: ignore.response.clone(),
                 detail: ignore.detail.clone(),
             });
             marked += 1;
@@ -183,6 +234,8 @@ mod tests {
             Ignore {
                 id: "GHSA-1".into(),
                 state: "not_affected",
+                justification: None,
+                response: vec![],
                 detail: None
             }
         );
@@ -191,6 +244,8 @@ mod tests {
             Ignore {
                 id: "GHSA-1".into(),
                 state: "not_affected",
+                justification: None,
+                response: vec![],
                 detail: Some("only used at build time".into())
             }
         );
@@ -199,6 +254,8 @@ mod tests {
             Ignore {
                 id: "CVE-1".into(),
                 state: "false_positive",
+                justification: None,
+                response: vec![],
                 detail: Some("wrong package".into())
             }
         );
@@ -211,6 +268,95 @@ mod tests {
         );
         assert!(Ignore::parse(":x").is_err());
         assert!(Ignore::parse("  ").is_err());
+    }
+
+    #[test]
+    fn ignore_justification_follows_an_explicit_state() {
+        assert_eq!(
+            Ignore::parse("CVE-1:not_affected:code_not_reachable:only the docs build imports it").unwrap(),
+            Ignore {
+                id: "CVE-1".into(),
+                state: "not_affected",
+                justification: Some("code_not_reachable"),
+                response: vec![],
+                detail: Some("only the docs build imports it".into())
+            }
+        );
+        let bare = Ignore::parse("CVE-1:not_affected:protected_at_perimeter").unwrap();
+        assert_eq!(bare.justification, Some("protected_at_perimeter"));
+        assert_eq!(bare.detail, None);
+        // Colons inside the text survive, with or without a justification before it.
+        assert_eq!(
+            Ignore::parse("CVE-1:not_affected:some text with: colons").unwrap(),
+            Ignore {
+                id: "CVE-1".into(),
+                state: "not_affected",
+                justification: None,
+                response: vec![],
+                detail: Some("some text with: colons".into())
+            }
+        );
+        assert_eq!(
+            Ignore::parse("CVE-1:not_affected:code_not_present:see: ABC-12")
+                .unwrap()
+                .detail
+                .as_deref(),
+            Some("see: ABC-12")
+        );
+        // Without an explicit state, a justification word is part of the text, as it always was.
+        let implicit = Ignore::parse("CVE-1:code_not_reachable:text").unwrap();
+        assert_eq!(implicit.justification, None);
+        assert_eq!(implicit.detail.as_deref(), Some("code_not_reachable:text"));
+        // An unknown word in that position stays part of the detail.
+        let unknown = Ignore::parse("CVE-1:not_affected:not_a_reason:text").unwrap();
+        assert_eq!(unknown.justification, None);
+        assert_eq!(unknown.detail.as_deref(), Some("not_a_reason:text"));
+        // A justification only explains not_affected.
+        let err = Ignore::parse("CVE-1:exploitable:code_not_present:text").unwrap_err();
+        assert!(err.contains("only applies to the not_affected state"), "{err}");
+    }
+
+    #[test]
+    fn ignore_response_follows_a_state_or_a_justification() {
+        let entry = Ignore::parse("CVE-1:exploitable:update:fixed in 2.3, rolling out").unwrap();
+        assert_eq!(entry.state, "exploitable");
+        assert_eq!(entry.response, ["update"]);
+        assert_eq!(entry.detail.as_deref(), Some("fixed in 2.3, rolling out"));
+        // A list, de-duplicated, in the order given; spaces around the commas are fine.
+        let entry = Ignore::parse("CVE-1:in_triage:will_not_fix, workaround_available,will_not_fix").unwrap();
+        assert_eq!(entry.response, ["will_not_fix", "workaround_available"]);
+        assert_eq!(entry.detail, None);
+        // Both segments, justification first.
+        assert_eq!(
+            Ignore::parse("CVE-1:not_affected:protected_at_perimeter:can_not_fix:the WAF blocks it").unwrap(),
+            Ignore {
+                id: "CVE-1".into(),
+                state: "not_affected",
+                justification: Some("protected_at_perimeter"),
+                response: vec!["can_not_fix"],
+                detail: Some("the WAF blocks it".into())
+            }
+        );
+        // A list with any unknown word is text, so an existing detail keeps its meaning.
+        let entry = Ignore::parse("CVE-1:exploitable:update,later:text").unwrap();
+        assert!(entry.response.is_empty());
+        assert_eq!(entry.detail.as_deref(), Some("update,later:text"));
+        // Without an explicit state a response word is text, as it always was.
+        let entry = Ignore::parse("CVE-1:update:text").unwrap();
+        assert!(entry.response.is_empty());
+        assert_eq!(entry.detail.as_deref(), Some("update:text"));
+    }
+
+    #[test]
+    fn apply_ignores_carries_the_justification() {
+        let mut sbom = sample_sbom();
+        sbom.vulnerabilities = vec![finding("GHSA-a", &[], Severity::High)];
+        let ignores =
+            [Ignore::parse("GHSA-a:not_affected:requires_configuration:will_not_fix:off by default").unwrap()];
+        apply_ignores(&mut sbom, &ignores);
+        let analysis = sbom.vulnerabilities[0].analysis.as_ref().unwrap();
+        assert_eq!(analysis.justification, Some("requires_configuration"));
+        assert_eq!(analysis.response, ["will_not_fix"]);
     }
 
     #[test]
@@ -231,6 +377,8 @@ mod tests {
             sbom.vulnerabilities[0].analysis,
             Some(Analysis {
                 state: "not_affected",
+                justification: None,
+                response: vec![],
                 detail: Some("not reachable".into())
             })
         );

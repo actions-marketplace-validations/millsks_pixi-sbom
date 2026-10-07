@@ -2261,6 +2261,58 @@ fn vex_is_written_beside_the_document_and_links_into_it() {
         .unwrap();
     assert_eq!(detail, "not reachable from our code");
 
+    // A machine-readable justification and a response reach the VEX, and 1.7 accepts them as
+    // 1.6 does.
+    let other = document["vulnerabilities"][1]["id"].as_str().unwrap().to_string();
+    run(&[
+        "--spec-version",
+        "1.7",
+        "--output",
+        sbom.to_str().unwrap(),
+        "--vex",
+        vex.to_str().unwrap(),
+        "--ignore-vuln",
+        &format!("{assessed}:not_affected:code_not_present:the module is stripped"),
+        "--ignore-vuln",
+        &format!("{other}:exploitable:update,workaround_available:pin urllib3>=2"),
+    ])
+    .assert()
+    .success();
+    let vexed = read_json(&vex);
+    assert_valid(&cyclonedx_1_7_validator(), &vexed);
+    let responded = &vexed["vulnerabilities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["id"] == other.as_str())
+        .unwrap()["analysis"];
+    assert_eq!(responded["state"], "exploitable");
+    assert_eq!(
+        responded["response"],
+        serde_json::json!(["update", "workaround_available"])
+    );
+    assert_eq!(responded["detail"], "pin urllib3>=2");
+    assert_valid(&cyclonedx_1_7_validator(), &read_json(&sbom));
+    let analysis = &vexed["vulnerabilities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["id"] == assessed.as_str())
+        .unwrap()["analysis"];
+    assert_eq!(analysis["justification"], "code_not_present");
+    assert_eq!(analysis["detail"], "the module is stripped");
+
+    // A justification explains not_affected and nothing else.
+    run(&[
+        "--output",
+        "-",
+        "--ignore-vuln",
+        &format!("{assessed}:exploitable:code_not_present:text"),
+    ])
+    .assert()
+    .code(2)
+    .stderr(predicate::str::contains("only applies to the not_affected state"));
+
     // A VEX needs findings to assess, and one document to point at.
     pixi_sbom()
         .current_dir(dir.path())
@@ -2272,6 +2324,25 @@ fn vex_is_written_beside_the_document_and_links_into_it() {
         .assert()
         .code(2)
         .stderr(predicate::str::contains("cannot be combined with '--report'"));
+
+    // A CycloneDX VEX links into a CycloneDX BOM, so SPDX output of any version is refused,
+    // and nothing is written.
+    for spec in ["2.3", "3.0"] {
+        run(&["--format", "spdx", "--spec-version", spec, "--vex", "spdx-vex.json"])
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains("cannot be combined with '--format spdx'"))
+            .stderr(predicate::str::contains("--spec-version 3.0"));
+    }
+    assert!(!dir.path().join("spdx-vex.json").exists());
+
+    // The same holds when the configuration file asks for SPDX.
+    std::fs::write(dir.path().join("pixi-sbom.toml"), "format = \"spdx\"\n").unwrap();
+    run(&["--vex", "spdx-vex.json"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("cannot be combined with '--format spdx'"));
+    std::fs::remove_file(dir.path().join("pixi-sbom.toml")).unwrap();
 }
 
 #[test]
@@ -2562,13 +2633,13 @@ fn fail_on_severity_exits_4_after_writing_and_ignores_are_recorded() {
         "--fail-on-severity",
         "high",
         "--ignore-vuln",
-        "GHSA-2xpw-w6gg-jr37:not_affected:streaming API unused",
+        "GHSA-2xpw-w6gg-jr37:not_affected:code_not_reachable:streaming API unused",
         "--ignore-vuln",
         "GHSA-38jv-5279-wg99",
         "--ignore-vuln",
         "CVE-2025-66418",
         "--ignore-vuln",
-        "GHSA-q2q7-5pp4-w6pg:false_positive:wrong package",
+        "GHSA-q2q7-5pp4-w6pg:false_positive:can_not_fix:wrong package",
         "--ignore-vuln",
         "GHSA-qccp-gfcp-xxvc",
         "--ignore-vuln",
@@ -2584,6 +2655,10 @@ fn fail_on_severity_exits_4_after_writing_and_ignores_are_recorded() {
     let streaming = vulns.iter().find(|v| v["id"] == "GHSA-2xpw-w6gg-jr37").unwrap();
     assert_eq!(streaming["analysis"]["state"], "not_affected");
     assert_eq!(streaming["analysis"]["detail"], "streaming API unused");
+    assert_eq!(streaming["analysis"]["justification"], "code_not_reachable");
+    let wrong = vulns.iter().find(|v| v["id"] == "GHSA-q2q7-5pp4-w6pg").unwrap();
+    assert_eq!(wrong["analysis"]["response"], serde_json::json!(["can_not_fix"]));
+    assert_eq!(wrong["analysis"]["detail"], "wrong package");
     let by_cve = vulns.iter().find(|v| v["id"] == "GHSA-gm62-xv2j-4w53").unwrap();
     assert_eq!(by_cve["analysis"]["state"], "not_affected");
     assert!(by_cve["analysis"].get("detail").is_none());
@@ -6355,7 +6430,7 @@ fn kev_and_accepted_findings_become_spdx_3_assessment_relationships() {
             "osv",
             "--kev",
             "--ignore-vuln",
-            "GHSA-q2q7-5pp4-w6pg:not_affected:the URL parser is never handed user input",
+            "GHSA-q2q7-5pp4-w6pg:not_affected:code_not_reachable:the URL parser is never handed user input",
             "--output",
             "-",
         ])
@@ -6391,6 +6466,7 @@ fn kev_and_accepted_findings_become_spdx_3_assessment_relationships() {
         vex[0]["security_impactStatement"],
         "the URL parser is never handed user input"
     );
+    assert_eq!(vex[0]["security_justificationType"], "vulnerableCodeNotInExecutePath");
 
     // Every timestamp we write is in the one shape SPDX 3 accepts: second precision, UTC, no
     // fractional part. The OSV records these came from carry nanoseconds.
