@@ -67,9 +67,12 @@ expression: "surface.join(\"\\n\")"
           - osv: The Open Source Vulnerabilities database (osv.dev): PyPI, crates.io, npm and other ecosystems it indexes; conda packages match through their PyPI purl
       --kev
       --fail-on-kev
+      --epss
+      --fail-on-epss <P>
       --fail-on-severity <SEVERITY>
           [possible values: low, medium, high, critical]
       --ignore-vuln <ID[:STATE][:TEXT]>
+      --vex-in <PATH>
       --vex <PATH>
       --vex-open <STATE>
           - in-triage:   Somebody still has to look at it
@@ -83,6 +86,7 @@ expression: "surface.join(\"\\n\")"
           - mapping
           - osv
           - kev
+          - epss
           - wheels
           - conda-info
           - pypi

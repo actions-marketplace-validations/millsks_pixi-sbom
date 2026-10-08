@@ -85,8 +85,11 @@ pub struct Config {
     pub vulnerabilities: Option<String>,
     pub kev: Option<bool>,
     pub fail_on_kev: Option<bool>,
+    pub epss: Option<bool>,
+    pub fail_on_epss: Option<f64>,
     pub fail_on_severity: Option<String>,
     pub ignore_vuln: Option<Vec<String>>,
+    pub vex_in: Option<Vec<PathBuf>>,
     pub ignore_license: Option<Vec<String>>,
     pub scorecard: Option<bool>,
     pub scorecard_min: Option<f64>,
@@ -435,6 +438,19 @@ pub fn apply(loaded: &Loaded, args: &mut Args, matches: &ArgMatches) -> Result<(
     }
     set!(kev, "kev", config.kev);
     set!(fail_on_kev, "fail_on_kev", config.fail_on_kev);
+    set!(epss, "epss", config.epss);
+    if let Some(threshold) = config.fail_on_epss {
+        note!("fail_on_epss");
+        if !(0.0..=1.0).contains(&threshold) {
+            return Err(ConfigError::Parse {
+                path: path.to_path_buf(),
+                message: format!("`fail-on-epss` must be a probability between 0.0 and 1.0, not {threshold}"),
+            });
+        }
+        if !on_cli(matches, "fail_on_epss") {
+            args.fail_on_epss = Some(threshold);
+        }
+    }
     if let Some(severity) = &config.fail_on_severity {
         note!("fail_on_severity");
         if !on_cli(matches, "fail_on_severity") {
@@ -452,6 +468,7 @@ pub fn apply(loaded: &Loaded, args: &mut Args, matches: &ArgMatches) -> Result<(
         }
     }
     set!(source, "source", config.source.clone());
+    set!(vex_in, "vex_in", config.vex_in.clone());
     set!(assume_used, "assume_used", config.assume_used.clone());
     set!(fail_on_phantom, "fail_on_phantom", config.fail_on_phantom);
     applied.sort();
@@ -542,10 +559,13 @@ mod tests {
             exclude-kind = ["conda-source"]
             vulnerabilities = "osv"
             kev = true
+            epss = true
+            fail-on-epss = 0.1
             fail-on-severity = "high"
             ignore-vuln = ["GHSA-1:not reachable"]
             fail-on-diff = ["added", "removed"]
             source = ["src", "tests"]
+            vex-in = ["vendor.openvex.json"]
             assume-used = ["pytest-*"]
             fail-on-phantom = true
             "#,
@@ -568,6 +588,9 @@ mod tests {
         assert_eq!(a.exclude_kind, [Kind::CondaSource]);
         assert_eq!(a.vulnerabilities, Some(VulnerabilitySource::Osv));
         assert!(a.kev);
+        assert!(a.epss);
+        assert_eq!(a.vex_in, [PathBuf::from("vendor.openvex.json")]);
+        assert_eq!(a.fail_on_epss, Some(0.1));
         assert_eq!(a.fail_on_severity, Some(FailOnSeverity::High));
         assert_eq!(a.ignore_vuln, ["GHSA-1:not reachable"]);
         assert_eq!(a.fail_on_diff, [DiffSection::Added, DiffSection::Removed]);
@@ -669,6 +692,8 @@ mod tests {
         );
         let cfg = loaded("exclude-kind = [\"wheel\"]");
         assert!(apply(&cfg, &mut a, &m).is_err());
+        let err = apply(&loaded("fail-on-epss = 5.0"), &mut a, &m).unwrap_err();
+        assert!(err.to_string().contains("between 0.0 and 1.0, not 5"), "{err}");
         assert!(parse_file(Path::new("x.toml"), "not = = toml", Source::Project).is_err());
     }
 

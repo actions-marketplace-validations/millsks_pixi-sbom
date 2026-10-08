@@ -409,6 +409,17 @@ fn vulnerability(vuln: &Vulnerability, sbom: &Sbom) -> VulnerabilityEntry {
             upgrades.push(format!("CISA KEV: {action}"));
         }
     }
+    if let Some(source) = vuln.analysis.as_ref().and_then(|a| a.source.as_ref()) {
+        properties.push(property("pixi:vex-source", source));
+    }
+    if let Some(epss) = &vuln.epss {
+        properties.push(property("pixi:epss", &epss.score.to_string()));
+        properties.push(property("pixi:epss-percentile", &epss.percentile.to_string()));
+        properties.push(property("pixi:epss-cve", &epss.cve_id));
+        if let Some(date) = &epss.date {
+            properties.push(property("pixi:epss-date", date));
+        }
+    }
     VulnerabilityEntry {
         bom_ref: format!("vuln-{}", vuln.id),
         id: vuln.id.clone(),
@@ -1091,6 +1102,7 @@ mod tests {
             }],
             analysis,
             kev: None,
+            epss: None,
         };
         sbom.vulnerabilities.push(finding("GHSA-open", None));
         sbom.vulnerabilities.push(finding(
@@ -1100,6 +1112,7 @@ mod tests {
                 justification: Some("code_not_reachable"),
                 response: vec!["will_not_fix"],
                 detail: Some("only used at build time".into()),
+                source: None,
             }),
         ));
 
@@ -1185,6 +1198,7 @@ mod tests {
                 justification: Some("requires_environment"),
                 response: vec![],
                 detail: Some("only used at build time".into()),
+                source: None,
             }),
             kev: Some(crate::model::Kev {
                 cve_id: "CVE-2021-33503".into(),
@@ -1193,6 +1207,12 @@ mod tests {
                 due_date: Some("2026-09-22".into()),
                 ransomware: true,
                 required_action: Some("Apply updates per vendor instructions.".into()),
+            }),
+            epss: Some(crate::model::Epss {
+                cve_id: "CVE-2021-33503".into(),
+                score: 0.03273,
+                percentile: 0.88073,
+                date: Some("2026-10-08".into()),
             }),
         });
         let doc = serde_json::to_value(document(&sbom, &fixed_context())).unwrap();
@@ -1211,6 +1231,21 @@ mod tests {
             props
                 .iter()
                 .any(|p| p["name"] == "pixi:kev-ransomware" && p["value"] == "true")
+        );
+        assert!(
+            props
+                .iter()
+                .any(|p| p["name"] == "pixi:epss" && p["value"] == "0.03273")
+        );
+        assert!(
+            props
+                .iter()
+                .any(|p| p["name"] == "pixi:epss-percentile" && p["value"] == "0.88073")
+        );
+        assert!(
+            props
+                .iter()
+                .any(|p| p["name"] == "pixi:epss-date" && p["value"] == "2026-10-08")
         );
 
         // Without a fixed version, the KEV required action is the recommendation.

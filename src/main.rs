@@ -5,10 +5,10 @@
 #![cfg_attr(not(test), forbid(unsafe_code))]
 
 use pixi_sbom::{
-    auditable, batch, cache, cli, concurrency, condaarchive, condalock, config, diff, discover, doctor, embedded,
+    auditable, batch, cache, cli, concurrency, condaarchive, condalock, config, diff, discover, doctor, embedded, epss,
     explain, explicit, filter, format, fromsbom, http, imports, kev, license, lock, manifest, mapping, mirror, model,
     osv, outdated, pdm, phantom, pkgcache, poetry, policy, prefix, progress, pylock, pypi, report, requirements,
-    scorecard, style, timings, uv, vulnpolicy, wheel,
+    scorecard, style, timings, uv, vexin, vulnpolicy, wheel,
 };
 
 /// The system allocator on macOS and Windows is slow under the many small allocations a
@@ -356,6 +356,18 @@ fn main() -> Result<()> {
         exclude_kinds: args.exclude_kind.iter().map(|k| k.package_kind()).collect(),
         keep_orphans: args.keep_orphans,
     };
+    let mut vex_statements = Vec::new();
+    for path in &args.vex_in {
+        let statements = vexin::load(path)?;
+        tracing::info!(path = %path.display(), statements = statements.len(), "read VEX statements");
+        vex_statements.extend(statements);
+    }
+    let mut vex_applied = vec![false; vex_statements.len()];
+    let vulnerability_rule = vulnpolicy::Rule {
+        severity: args.fail_on_severity.map(|s| s.severity()),
+        kev: args.fail_on_kev,
+        epss: args.fail_on_epss,
+    };
     let kev_catalog = if args.kev {
         let catalog = kev::Catalog::load(&mapping::cache_dir())?;
         tracing::info!(
@@ -478,15 +490,30 @@ fn main() -> Result<()> {
                 let known_exploited = kev::apply(&mut sbom, catalog);
                 tracing::info!(known_exploited, "matched findings against the CISA KEV catalog");
             }
+            if args.epss {
+                let cves = epss::cves(&sbom);
+                let scores = epss::lookup(&mapping::cache_dir(), &cves)?;
+                let scored = epss::apply(&mut sbom, &scores);
+                tracing::info!(cves = cves.len(), scored, "scored findings with FIRST EPSS");
+            }
+            if !vex_statements.is_empty() {
+                let applied = vexin::apply(&mut sbom, &vex_statements);
+                tracing::info!(
+                    applied = applied.iter().filter(|a| **a).count(),
+                    "applied VEX statements to the findings"
+                );
+                for (seen, now) in vex_applied.iter_mut().zip(applied) {
+                    *seen |= now;
+                }
+            }
+            // After the VEX, so a local decision wins over the vendor's.
             let ignored = vulnpolicy::apply_ignores(&mut sbom, &ignores);
-            if args.fail_on_severity.is_some() || args.fail_on_kev {
-                let threshold = args.fail_on_severity.map(|s| s.severity());
-                let hits = vulnpolicy::check(&sbom, threshold, args.fail_on_kev);
+            if vulnerability_rule.is_set() {
+                let hits = vulnpolicy::check(&sbom, &vulnerability_rule);
                 tracing::info!(
                     ignored,
                     hits = hits.len(),
-                    threshold = threshold.map(|s| s.name()).unwrap_or("-"),
-                    kev = args.fail_on_kev,
+                    rule = %vulnerability_rule,
                     "checked the vulnerability gate"
                 );
                 gate_hits.extend(
@@ -720,6 +747,7 @@ fn main() -> Result<()> {
                 }
                 _ => {
                     let mut report = report::Report::new(kind, &sbom);
+                    report.epss = args.epss;
                     if args.tree {
                         report.as_tree(&sbom, args.depth);
                     }
@@ -807,16 +835,19 @@ fn main() -> Result<()> {
             .into_diagnostic()
             .wrap_err("cannot write the report to stdout")?;
     }
+    for (statement, applied) in vex_statements.iter().zip(&vex_applied) {
+        if !applied {
+            tracing::warn!(
+                statement = statement.describe(),
+                "a VEX statement matches no finding: no such vulnerability here, or not for these package versions"
+            );
+        }
+    }
     if !gate_hits.is_empty() {
         let mut stderr = std::io::stderr().lock();
-        let rule = match (args.fail_on_severity, args.fail_on_kev) {
-            (Some(s), true) => format!("at or above {} or known exploited", s.severity().name()),
-            (Some(s), false) => format!("at or above {}", s.severity().name()),
-            (None, _) => "known exploited".to_string(),
-        };
         let _ = writeln!(
             stderr,
-            "Vulnerability gate failed: {} finding(s) {rule}:",
+            "Vulnerability gate failed: {} finding(s) {vulnerability_rule}:",
             gate_hits.len()
         );
         for (environment, platform, hit) in &gate_hits {
@@ -1052,8 +1083,10 @@ fn validate(args: &cli::Args) {
     if args.vulnerabilities.is_none() {
         for (set, flag) in [
             (args.kev, "--kev"),
+            (args.epss, "--epss"),
             (args.fail_on_severity.is_some(), "--fail-on-severity"),
             (!args.ignore_vuln.is_empty(), "--ignore-vuln"),
+            (!args.vex_in.is_empty(), "--vex-in"),
             (
                 args.report == Some(report::ReportKind::Vulnerabilities),
                 "--report vulnerabilities",
@@ -1069,6 +1102,9 @@ fn validate(args: &cli::Args) {
     }
     if args.fail_on_kev && !args.kev {
         usage(MissingRequiredArgument, "'--fail-on-kev' needs '--kev'");
+    }
+    if args.fail_on_epss.is_some() && !args.epss {
+        usage(MissingRequiredArgument, "'--fail-on-epss' needs '--epss'");
     }
     if args.fail_on_yanked && !(args.fetch_licenses || args.pypi_licenses) {
         usage(
@@ -1499,6 +1535,7 @@ fn selects_an_upstream(args: &cli::Args, fetch_licenses: bool) -> bool {
     fetch_licenses
         || args.embedded_sboms
         || args.kev
+        || args.epss
         || args.scorecard
         || args.vulnerabilities.is_some()
         || args.pypi_mapping == cli::PypiMappingSource::Prefix
@@ -1591,6 +1628,7 @@ fn every_service(lockfile: Option<&std::path::Path>, kind: cli::CondaIndexKind) 
         ),
         http::Service::new("OSV", osv::api_url(), osv::API_URL_ENV),
         http::Service::new("CISA KEV", kev::url(), kev::URL_ENV),
+        http::Service::new("FIRST EPSS", epss::url(), epss::URL_ENV),
         conda_index_service(kind),
         http::Service::new("OpenSSF Scorecard", scorecard::url(), scorecard::SCORECARD_URL_ENV),
     ]
@@ -1627,6 +1665,9 @@ fn network_configuration(args: &cli::Args, fetch_licenses: bool, tls_roots: &htt
     }
     if args.kev {
         services.push(http::Service::new("CISA KEV", kev::url(), kev::URL_ENV));
+    }
+    if args.epss {
+        services.push(http::Service::new("FIRST EPSS", epss::url(), epss::URL_ENV));
     }
     if args.report == Some(report::ReportKind::Outdated) {
         services.push(conda_index_service(args.conda_index_kind));
