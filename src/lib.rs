@@ -93,8 +93,10 @@ pub mod pylock;
 pub mod pypi;
 #[doc(hidden)]
 pub mod pyversion;
+pub mod quality;
 #[doc(hidden)]
 pub mod report;
+pub mod requirements;
 #[doc(hidden)]
 pub mod scope;
 pub mod scorecard;
@@ -104,6 +106,7 @@ pub mod stdlib;
 pub mod style;
 #[doc(hidden)]
 pub mod timings;
+pub mod unlocked;
 pub mod uv;
 #[doc(hidden)]
 pub mod vulnpolicy;

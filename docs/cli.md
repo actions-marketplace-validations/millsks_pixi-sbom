@@ -18,7 +18,7 @@ With no options this means:
 
 | Option | Default | Effect |
 |---|---|---|
-| `--lockfile <PATH>` | upward search from cwd | Lockfile to read: a `pixi.lock`, a `uv.lock` (see [Reading uv.lock](#reading-uvlock)), a `poetry.lock` (see [Reading poetry.lock](#reading-poetrylock)), a `pdm.lock` (see [Reading pdm.lock](#reading-pdmlock)), a `conda-lock.yml` (see [Reading conda-lock.yml](#reading-conda-lockyml)), an explicit conda spec file (see [Reading an explicit spec file](#reading-an-explicit-spec-file)), or a PEP 751 `pylock.toml` / `pylock.<name>.toml` (see [Reading pylock.toml](#reading-pylocktoml)). The file must exist; there is no fallback search when this is given. Without it, the nearest directory at or above the current one that has a lockfile is used, and within a directory the first in the order of [Which lockfile is found](#which-lockfile-is-found). |
+| `--lockfile <PATH>` | upward search from cwd | Lockfile to read: a `pixi.lock`, a `uv.lock` (see [Reading uv.lock](#reading-uvlock)), a `poetry.lock` (see [Reading poetry.lock](#reading-poetrylock)), a `pdm.lock` (see [Reading pdm.lock](#reading-pdmlock)), a `conda-lock.yml` (see [Reading conda-lock.yml](#reading-conda-lockyml)), an explicit conda spec file (see [Reading an explicit spec file](#reading-an-explicit-spec-file)), a fully pinned `requirements.txt` (see [Reading a pinned requirements.txt](#reading-a-pinned-requirementstxt)), or a PEP 751 `pylock.toml` / `pylock.<name>.toml` (see [Reading pylock.toml](#reading-pylocktoml)). The file must exist; there is no fallback search when this is given. Without it, the nearest directory at or above the current one that has a lockfile is used, and within a directory the first in the order of [Which lockfile is found](#which-lockfile-is-found). |
 | `--prefix <DIR>` | | Describe an installed environment instead of a lockfile: a conda environment, a venv or a Python installation (see below). Cannot be combined with `--lockfile` or the `--all-*` flags; `--environment` only names the lockfile side of `--against`. |
 | `--root-name <NAME>`, `--root-version <VERSION>` | directory name, none | With `--prefix`: what the described application is called. |
 | `--config <PATH>` | see below | Configuration file to read before the command line. |
@@ -48,6 +48,7 @@ With no options this means:
 | `--scorecard` | off | With `--fetch-licenses`: ask the OpenSSF Scorecard service how each package's repository is maintained and record the score in the document. |
 | `--scorecard-min <N>` | `5` | With `--scorecard`: the score a package or a check has to reach to be left alone. |
 | `--fail-on-scorecard <N>` | | With `--scorecard`: exit **9** when a scored package is below this. Unscored packages never fail. |
+| `--min-quality <N>` | | Exit **10** (document written first) when the document's quality score, out of 100, is below this; see [How complete the document is](#how-complete-the-document-is). Most useful with `--from-sbom`. |
 | `--fail-on-yanked` | off | With `--fetch-licenses`: exit **7** after writing the document when any PyPI package is a yanked release (PEP 592). |
 | `--vulnerabilities <osv>` | off | Look up known vulnerabilities of every package with a purl OSV can answer and record them in the document (see below). |
 | `--kev` | off | With `--vulnerabilities`: mark findings whose CVE alias is in CISA's Known Exploited Vulnerabilities catalog (downloaded once a day). They are rated `critical`, sorted first, and carry the catalog's dates and required action. |
@@ -75,7 +76,7 @@ and always will be** — they are hidden from `--help` so there is one name to l
 `--pypi-licenses` likewise still works as an alias of `--fetch-licenses`, with a warning, as it has since 0.4.0.
 Nothing in this table is scheduled for removal; dropping any of it would be a major version with its own notice.
 [What 1.0 freezes](stability.md) is the full contract.
-| `--report <packages\|licenses\|vulnerabilities\|diff\|outdated\|python\|phantom\|scorecard>` | | Print a report to the terminal instead of writing a document (see below). Cannot be combined with `--output`; `vulnerabilities` needs `--vulnerabilities`, `diff` needs `--against`. |
+| `--report <packages\|licenses\|vulnerabilities\|diff\|outdated\|python\|phantom\|scorecard\|quality>` | | Print a report to the terminal instead of writing a document (see below). Cannot be combined with `--output`; `vulnerabilities` needs `--vulnerabilities`, `diff` needs `--against`. |
 | `--tree` | off | With `--report packages`: draw the dependency graph from the root downward instead of a flat list. |
 | `--depth <N>` | unlimited | With `--tree`: how deep to go (`0` shows what the root depends on and nothing below). |
 | `--group-by license` | | With `--report licenses`: one section per license instead of one row per package. |
@@ -135,7 +136,8 @@ there:
 One directory is one project, so a project with both a `pixi.lock` and a `uv.lock` gets one document, not two; pass
 `--lockfile` to read the other. An explicit conda spec file has no fixed name, so it is never discovered and only
 read through `--lockfile`. When nothing is found, `pixi_sbom::discover::not_found` (or `none_found` for `--scan`)
-lists the names it looked for:
+lists the names it looked for, and `not_found` first names the nearest manifest it passed with no lockfile beside it
+and the command that locks it ("pyproject.toml is a Poetry project's manifest: run `poetry lock` beside it"):
 
 ```text
   × no pixi.lock, uv.lock, pylock.toml, poetry.lock, pdm.lock or conda-lock.yml found in /work/app or any parent directory
@@ -369,6 +371,41 @@ The graph comes from each entry's `dependencies`; a pip package's dependency on 
 the conda package. The project's name comes from a `pixi.toml` or `pyproject.toml` beside the file, and is the
 directory's name otherwise. The upward search does not look for `conda-lock.yml` yet; `--environment` and
 `--all-environments` are refused, since the file has no environments.
+
+## Reading a pinned requirements.txt
+
+A `requirements.txt` in which every requirement is pinned to one version is a lock in all but name, and is read as
+one, with nothing resolved. That is what `pip-compile --generate-hashes` and `uv pip compile` write:
+
+```sh
+pixi sbom --lockfile requirements.txt -p linux-64
+pixi sbom --lockfile requirements/prod.txt --vulnerabilities osv --fail-on-severity high
+```
+
+| From the file | In the document |
+|---|---|
+| `name==version` (or `===`) | a `pkg:pypi` package of that version |
+| `--hash=sha256:` | the first digest as the package's hash |
+| `; marker` | evaluated for `--platform` (default the host) and the interpreter pip-compile names in its header (`autogenerated by pip-compile with Python 3.13`), else 3.14; kept as `pixi:marker` |
+| `# via requests` | an edge from `requests` |
+| `# via -r requirements.in` | declared by the project: `pixi:direct`, and the root depends on these alone |
+| `--index-url` / `-i` | the supplier and `pixi:index-url` (default `https://pypi.org/simple`) |
+| `-r` / `-c` | the included file, read the same way, once |
+
+Anything not pinned is refused rather than resolved: a range (`django>=5`), a bare name, a wildcard (`==5.*`), a URL,
+or an editable install (`-e`). The error names the first such line and the command that makes a lock of the file
+(`pixi_sbom::requirements::not_pinned`):
+
+```text
+  × line 1 of requirements.txt is not pinned to one version: django>=5.2
+  help: pixi-sbom reads a lock and never resolves one; make this file a lock with `uv pip compile requirements.txt -o
+        pylock.toml` (then pass pylock.toml), or `pip-compile --generate-hashes requirements.txt` (then pass what it writes)
+```
+
+A requirements file is recognised by holding requirement lines rather than TOML, YAML or JSON, and by its name: one
+with `requirements` in it is read whatever it pins (so ranges get the error above), any other `.txt` or `.in` file
+only when it pins something. Like an explicit spec it is only read through `--lockfile` (or `--against`),
+never found by the upward search, since most `requirements.txt` files in a project are not locks.
 
 ## Reading an explicit spec file
 
@@ -865,9 +902,12 @@ pixi sbom --report outdated --outdated-min major --report-format markdown
 | `Step` | `patch`, `minor` or `major`, by the leading numeric segments; `current` when nothing is newer |
 
 Rows are ordered furthest behind first, then oldest. PyPI packages are read from the project document
-(`/pypi/<name>/json`). Conda packages are asked of whichever index `--conda-index-kind` selects. Source packages
-and anything the index cannot answer for are listed under *No releases to compare against* rather than guessed at.
-Documents are cached for a day, so a second run is free.
+(`/pypi/<name>/json`). Conda packages are asked of whichever index `--conda-index-kind` selects. A package the index
+has no releases for (one from a private channel, say) is listed under *No releases to compare against* rather than
+guessed at. A package no index covers at all (a source package pixi built, another ecosystem's purl, none, a git or
+local install) is listed under *Not checked* instead, and an index that did not answer under *Could not be checked*:
+three different reasons for one missing answer, each counted (`not_checked`, `unknown` and `unavailable` in the JSON
+report). Documents are cached for a day, so a second run is free.
 
 A package installed from a mirror is a case of its own. Its channel is named after the local repository, so no
 index has heard of it, and asking by name returns nothing. The lockfile records a sha256 and a proxying mirror
@@ -1041,6 +1081,40 @@ weakest checks, a table of how many fall in each band, and the ones below the th
 `--fail-on-scorecard <N>` exits **9** when a scored package is below `N`. A package the service has never scored,
 or one with no repository to ask about, is reported as unknown and never fails the gate: the answer is missing,
 not bad.
+
+## How complete the document is
+
+An SBOM can pass every gate by leaving things out: a vendor document without purls has no advisories to match, one
+without a graph hides what pulled a package in. Before gating on somebody else's document, grade it:
+
+```sh
+pixi sbom --from-sbom vendor.cdx.json --report quality
+pixi sbom --from-sbom vendor.cdx.json --min-quality 70 --vulnerabilities osv --fail-on-severity high --output -
+```
+
+`--report quality` scores nine elements out of 100: the seven NTIA minimum elements (supplier, name, version,
+unique identifier, dependency relationships, author, timestamp) and license and hash coverage. A per-package element
+is the share of packages that have it: a purl for the unique identifier, a place in the dependency graph (depending
+on something, or depended on, past the root's own edges) for the relationships. The author is the document's named
+authors (the generating tool is recorded separately and does not count); the timestamp is always there, since the
+document is written now. The overall score is the mean of the nine, and the NTIA score the mean of the seven.
+
+```text
+Element                   Score  Covers                                                          NTIA minimum
+-------------------------------------------------------------------------------------------------------------
+supplier                  0      0 of 15 packages name a supplier                                yes
+unique identifier         60     9 of 15 packages have a purl                                    yes
+dependency relationships  53     8 of 15 packages are in the dependency graph                    yes
+hash                      0      0 of 15 packages have a hash                                    -
+...
+Quality: 51 of 100 for 15 packages (NTIA minimum elements: 59 of 100)
+```
+
+That is a document syft wrote for a venv; a `pixi.lock` document scores 86, losing only the author it was never
+given and the licenses of its six PyPI packages, which a lockfile does not record and `--fetch-licenses` adds. The grade is of the document as this run would write it, so
+`--fetch-licenses` and the other enrichment count. `--min-quality <N>` fails the run with exit 10 below `N`, after
+writing the document, and names the weakest elements on stderr. It applies to every input, and is also the
+configuration key `min-quality`.
 
 ## What is imported but never declared
 
@@ -1322,7 +1396,8 @@ pixi sbom --from-sbom sbom.cdx.json --format spdx --output sbom.spdx.json   # co
 
 The reader is the one behind `--against`, so CycloneDX 1.4–1.7, SPDX 2.x and SPDX 3.0.1 are all accepted. From
 CycloneDX and SPDX 2.x it takes the packages, versions, purls, licenses, hashes, descriptions, download locations,
-the dependency graph and the `pixi:*` properties a document this tool wrote carries — so a document of ours
+the repository (a CycloneDX `vcs` reference, or an SPDX `downloadLocation` that is a VCS URL) and homepage, the
+dependency graph and the `pixi:*` properties a document this tool wrote carries — so a document of ours
 round-trips unchanged, declared dependencies and all. SPDX 3.0.1 is read as packages, versions, purls and
 licenses; its graph, hashes and properties do not come back.
 
@@ -1330,7 +1405,15 @@ The described application's name and version come from the document's own root c
 `--root-version` say otherwise, and the environment and platform from what the document records (`default` and
 empty when it records nothing, or whatever `--platform` says). A purl that is neither `pkg:conda` nor `pkg:pypi`,
 and a package with no purl at all, is recorded as the `external` kind: the document is the only thing that knows
-what it is.
+what it is. What a scanner lists besides packages is left out: syft, for one, adds every file it read
+(CycloneDX `"type": "file"`) and the scanned directory (SPDX `primaryPackagePurpose: FILE`).
+
+The reports that look packages up work from the purls. `--report outdated` asks PyPI and the conda index about the
+`pkg:pypi` and `pkg:conda` ones and lists the rest under *Not checked*, counted rather than dropped. `--scorecard`
+scores the repository the document names, or for a PyPI package the one PyPI's `project_urls` name (see
+[How well each dependency is looked after](#how-well-each-dependency-is-looked-after)); syft names none, so for its
+documents every score comes from there. A document syft wrote for a venv gives the same answers in CycloneDX and in
+SPDX, which `tests/matrix.rs` checks.
 
 What is written carries `pixi:source-document` — the source's serial number or namespace — in place of
 `pixi:lockfile`, so the derivation is traceable. Enrichment that needs a lockfile or a local package cache
@@ -1907,6 +1990,7 @@ pixi sbom --all-environments --all-platforms --output sboms/
 | 7 | `--fail-on-yanked` found a yanked release; the documents were written and the releases listed on stderr. |
 | 8 | `--fail-on-phantom` found an import the manifest never declared; the report was printed and the packages listed on stderr. |
 | 9 | `--fail-on-scorecard` found a scored repository below the threshold; the document was written and the packages listed on stderr. |
+| 10 | `--min-quality` found the document's quality score below the threshold; the document was written and the weakest elements listed on stderr. |
 
 Several gates can fail in one run. Each prints its own list, and the run then says which of them fired and which
 one chose the exit code, because in CI the code is the headline and the log is long:
@@ -1917,7 +2001,7 @@ Exiting 3 (license policy); the others would have been 4.
 ```
 
 The precedence is the order of the table above: the license policy first, then vulnerabilities, yanked releases,
-phantom imports, the comparison, and scorecards last.
+phantom imports, the comparison, scorecards, and quality last.
 | 2 | Command-line usage error (unknown option, conflicting options such as `--output -` with `--all-environments` or `--all-platforms`, or a `--spec-version` of the other format, or a `--allow-license` / `--deny-license` value that is not an SPDX identifier). |
 
 Runtime diagnostics carry a stable code you can grep for in CI logs:

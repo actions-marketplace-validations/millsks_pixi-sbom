@@ -220,6 +220,10 @@ repository with a 4.2 scorecard, and yanks six; conda packages get no advisory (
   read (poetry.lock and pdm.lock record no URLs; an installed dist-info names none here). The git and local
   packages are not looked up by name, so 25 of 27 are scored.
 - yanked gate: six is the yanked one; inputs without it pass.
+- the syft documents (tests/fixtures/syft) describe a venv: 9 PyPI packages and 6 executables syft found
+  ('Simple Launcher', no purl), which outdated lists as not checked. syft names no repositories, so the scores
+  come from the PyPI lookup. The diff counts 10, not 15: it matches by kind and name, and the six executables
+  share one.
 - licenses and outdated on the Python lockfiles count 25 of 27: the git checkout (django-debug-toolbar) and the
   local directory (internal-utils) are not asked about by name, since the index would describe an unrelated
   project of that name.
@@ -277,6 +281,10 @@ fn inputs(work: &Path) -> Vec<Input> {
             args: lockfile(examples.join("pdm/01-django/pdm.lock")),
         },
         Input {
+            name: "requirements.txt (pip-compile)",
+            args: lockfile(fixtures.join("lockfile-routes/requirements.txt")),
+        },
+        Input {
             name: "conda-lock.yml",
             args: lockfile(examples.join("conda-lock/01-django/conda-lock.yml")),
         },
@@ -301,6 +309,20 @@ fn inputs(work: &Path) -> Vec<Input> {
         Input {
             name: "--from-sbom",
             args: vec!["--from-sbom".into(), document.display().to_string()],
+        },
+        Input {
+            name: "--from-sbom (syft CycloneDX)",
+            args: vec![
+                "--from-sbom".into(),
+                fixtures.join("syft/app.cdx.json").display().to_string(),
+            ],
+        },
+        Input {
+            name: "--from-sbom (syft SPDX)",
+            args: vec![
+                "--from-sbom".into(),
+                fixtures.join("syft/app.spdx.json").display().to_string(),
+            ],
         },
     ]
 }

@@ -7,8 +7,8 @@
 use pixi_sbom::{
     auditable, batch, cache, cli, concurrency, condaarchive, condalock, config, diff, discover, doctor, embedded,
     explain, explicit, filter, format, fromsbom, http, imports, kev, license, lock, manifest, mapping, mirror, model,
-    osv, outdated, pdm, phantom, pkgcache, poetry, policy, prefix, progress, pylock, pypi, report, scorecard, style,
-    timings, uv, vulnpolicy, wheel,
+    osv, outdated, pdm, phantom, pkgcache, poetry, policy, prefix, progress, pylock, pypi, report, requirements,
+    scorecard, style, timings, uv, vulnpolicy, wheel,
 };
 
 /// The system allocator on macOS and Windows is slow under the many small allocations a
@@ -227,6 +227,14 @@ fn main() -> Result<()> {
             let targets = match &input {
                 Input::Lock { lock, .. } => resolve_targets(&args, lock, &lockfile, None)?,
                 Input::CondaLock { lock, .. } => condalock_targets(&args, lock, &lockfile),
+                Input::Requirements { .. } => {
+                    refuse_workspace_flags(&args, "a requirements file");
+                    vec![Target {
+                        environment: "default".to_string(),
+                        platform: args.platform.clone(),
+                        output: discover::resolve_output(args.output.as_deref(), &lockfile, args.format),
+                    }]
+                }
                 Input::Explicit { .. } => {
                     refuse_workspace_flags(&args, "an explicit spec file");
                     vec![Target {
@@ -329,6 +337,7 @@ fn main() -> Result<()> {
     let mut phantoms: Vec<(String, String, String)> = Vec::new();
     let mut diff_hits: Vec<(String, String, String)> = Vec::new();
     let mut low_scores: Vec<(String, String, String)> = Vec::new();
+    let mut low_quality: Vec<(String, String, String)> = Vec::new();
     let assume_used = parse_globs(&args.assume_used, "--assume-used");
     let explain_patterns = parse_globs(&args.explain, "--explain");
     let explain_context = explain::Context {
@@ -524,6 +533,22 @@ fn main() -> Result<()> {
                     .into_iter()
                     .map(|v| (sbom.environment.clone(), sbom.platform.clone(), v)),
             );
+        }
+        // The quality gate grades the document as it stands after the enrichment that fills it in
+        // (licenses, hashes, repositories); before the reports that end this target's turn early.
+        if let Some(min) = args.min_quality {
+            let grade = pixi_sbom::quality::assess(&sbom);
+            if grade.overall < min {
+                low_quality.push((
+                    sbom.environment.clone(),
+                    sbom.platform.clone(),
+                    format!(
+                        "{} of 100, weakest: {}",
+                        grade.overall,
+                        pixi_sbom::quality::weakest(&grade, 3).join(", ")
+                    ),
+                ));
+            }
         }
         if args.report == Some(report::ReportKind::Outdated) {
             let cache_dir = mapping::cache_dir();
@@ -803,6 +828,19 @@ fn main() -> Result<()> {
         }
         let _ = stderr.flush();
     }
+    if !low_quality.is_empty() {
+        let mut stderr = std::io::stderr().lock();
+        let min = args.min_quality.unwrap_or_default();
+        let _ = writeln!(stderr, "SBOM quality below {min} (--report quality says why):");
+        for (environment, platform, line) in &low_quality {
+            let _ = if targets.len() > 1 {
+                writeln!(stderr, "  [{environment}/{platform}] {line}")
+            } else {
+                writeln!(stderr, "  {line}")
+            };
+        }
+        let _ = stderr.flush();
+    }
     if !low_scores.is_empty() {
         let mut stderr = std::io::stderr().lock();
         let min = args.fail_on_scorecard.unwrap_or_default();
@@ -882,6 +920,7 @@ fn main() -> Result<()> {
         ),
         Gate::new("the comparison", diff_hits.len(), diff::DIFF_EXIT_CODE),
         Gate::new("scorecards", low_scores.len(), SCORECARD_EXIT_CODE),
+        Gate::new("quality", low_quality.len(), pixi_sbom::quality::QUALITY_EXIT_CODE),
     ];
     let failed: Vec<&Gate> = failed.iter().filter(|gate| gate.count > 0).collect();
     if let Some(first) = failed.first() {
@@ -1670,6 +1709,21 @@ fn read_input(lockfile: &Path) -> Result<Input> {
             manifest: manifest(),
         });
     }
+    // A manifest that declares rather than locks: say which command locks it, rather than failing
+    // to parse it as a pixi.lock.
+    if let Some(not_a_lock) = pixi_sbom::unlocked::diagnose(lockfile) {
+        return Err(miette::Report::new(not_a_lock));
+    }
+    // A pinned requirements file (pip-compile's), by its name and its plain requirement lines.
+    if requirements::is_requirements(lockfile) {
+        let requirements::Loaded { requirements, contents } =
+            timings::time(timings::Phase::Input, || requirements::load(lockfile))?;
+        return Ok(Input::Requirements {
+            requirements,
+            contents,
+            manifest: manifest(),
+        });
+    }
     let lock::LoadedLock { lock, contents } = timings::time(timings::Phase::Input, || lock::load(lockfile))?;
     Ok(Input::Lock {
         lock,
@@ -1728,6 +1782,13 @@ enum Input {
         contents: String,
         manifest: manifest::Manifest,
     },
+    /// A fully pinned requirements file, with its text and the manifest beside it (for the
+    /// project's name; the file's own `# via -r` lines say what it declared).
+    Requirements {
+        requirements: requirements::Requirements,
+        contents: String,
+        manifest: manifest::Manifest,
+    },
     /// An explicit conda spec file (`@EXPLICIT`), with its text and the manifest beside it.
     Explicit {
         explicit: explicit::Explicit,
@@ -1782,6 +1843,7 @@ impl Input {
         match self {
             Input::Lock { manifest, .. }
             | Input::Explicit { manifest, .. }
+            | Input::Requirements { manifest, .. }
             | Input::CondaLock { manifest, .. }
             | Input::Pdm { manifest, .. }
             | Input::Poetry { manifest, .. }
@@ -1888,6 +1950,19 @@ fn model_for(workspace: &Workspace, environment: &str, platform: Option<&str>) -
             )?;
             // What the workspace asked for itself, as opposed to what came along.
             manifest.apply(&mut sbom);
+            (sbom, contents.clone())
+        }
+        Input::Requirements {
+            requirements,
+            contents,
+            manifest,
+        } => {
+            let sbom = requirements::build_sbom(
+                requirements,
+                platform,
+                manifest.root.clone(),
+                &discover::lockfile_name(lockfile),
+            )?;
             (sbom, contents.clone())
         }
         Input::Explicit {
