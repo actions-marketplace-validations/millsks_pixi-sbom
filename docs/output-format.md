@@ -115,6 +115,7 @@ entry).
 | `pixi:scorecard-check-<name>` | any | One per check below `--scorecard-min`, e.g. `pixi:scorecard-check-Signed-Releases=0.0` |
 | `pixi:cargo-source` | embedded (cargo) | Where a crate read from a `cargo auditable` binary came from: `crates.io`, `git`, `local`, ... |
 | `pixi:index-url` | PyPI | Index the wheel was resolved from |
+| `pixi:repository-source` | PyPI (`--fetch-licenses`) | Where the package's repository URL came from: `wheel` (its `dist-info`) or `pypi` (the JSON API's `project_urls`, for a package whose lockfile names no wheel) |
 | `pixi:resolution-markers` | PyPI (`uv.lock`) | For a package uv locked at more than one version, the environments this one is for, joined with ` \|\| ` |
 | `pixi:marker` | PyPI (`pylock.toml`) | The environment marker the lockfile put on the package, e.g. `sys_platform == 'win32'`; the package is in the document because the marker is true for its platform |
 | `pixi:direct-url` | PyPI (`pylock.toml`, `uv.lock`, `--prefix`) | Where a package installed from outside an index came from: the repository URL of a VCS source, the path of a local directory (relative to the lockfile), or the URL of an archive |
@@ -145,7 +146,7 @@ In SPDX these appear in the package `comment` because SPDX 2.3 has no free-form 
 A package installed from somewhere other than an index does not get a plain `pkg:pypi` purl, since that would claim
 a PyPI release which may not exist or may hold other code, and a scanner would match the wrong advisories. Where it
 came from stays in `pixi:direct-url`, `pixi:source-rev` and `pixi:editable`, from every lockfile reader and from
-`--prefix` (PEP 610 `direct_url.json`). `--vulnerabilities osv` asks about none of these purls: OSV has no ecosystem
+`--prefix` (PEP 610 `direct_url.json`). Nor are they looked up on PyPI by name for a license, a yanked status or the outdated report, since the name may belong to an unrelated project. `--vulnerabilities osv` asks about none of these purls: OSV has no ecosystem
 for `generic` or `github`, and a `vcs_url` checkout is not the release of its version. In `pixi.lock` a git or local
 source is recognised; a URL without an index is left as it is, since older lockfiles record index wheels that way.
 
