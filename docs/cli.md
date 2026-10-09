@@ -810,6 +810,10 @@ value is in the run that is not.
 
 ### Exploit likelihood (FIRST EPSS)
 
+<p align="center">
+  <img src="assets/report-epss.gif" alt="pixi sbom --vulnerabilities osv --kev --epss --report vulnerabilities: nine urllib3 1.26.4 findings, each with its EPSS probability and percentile beside the KEV flag, the known-exploited one at 0.033 (p88)." width="100%">
+</p>
+
 KEV covers what is already exploited; most findings are not in it, and severity alone does not say which of the
 rest are likely to be. `--epss` asks [FIRST's Exploit Prediction Scoring System](https://www.first.org/epss/) for
 every CVE among the findings' ids and aliases, in batches of 100, and records two numbers per finding: the
@@ -911,6 +915,10 @@ CycloneDX SBOM, so `--format spdx` is refused too. With SPDX, use `--spec-versio
 the assessments itself, in its security profile.
 
 ### Applying a vendor's VEX
+
+<p align="center">
+  <img src="assets/vex-in.gif" alt="Three runs: --fail-on-kev fails on the known-exploited urllib3 finding and exits 4; with --vex-in vendor.openvex.json the same gate passes; the report lists the finding as ignored, not_affected, from vendor.openvex.json, with the vendor's reason." width="100%">
+</p>
 
 A vendor that ships an SBOM often ships a VEX saying which of its findings do not affect the product. Without it,
 the gate fires on those findings, typically with `--from-sbom`, and the only way through is to copy each one into
@@ -1149,6 +1157,10 @@ or one with no repository to ask about, is reported as unknown and never fails t
 not bad.
 
 ## How complete the document is
+
+<p align="center">
+  <img src="assets/report-quality.gif" alt="pixi sbom --report quality twice: this workspace scores 86 of 100, with every NTIA element present but the author; a document syft wrote for a venv scores 51, with no suppliers, no hashes, and 6 of its 15 packages without a purl." width="100%">
+</p>
 
 An SBOM can pass every gate by leaving things out: a vendor document without purls has no advisories to match, one
 without a graph hides what pulled a package in. Before gating on somebody else's document, grade it:
@@ -1500,8 +1512,11 @@ pixi sbom --scan . --merge --root-name product --output product.cdx.json
 
 - **Packages** with the same purl are one package. The first input's copy is kept; later ones add their extra
   purls and any property, license, hash, supplier, homepage or repository it lacks. When two inputs disagree on
-  the license or a hash, the first is kept, a warning is logged, and the package records the disagreement as
-  `pixi:merge-conflict` (`license: MIT (a) vs GPL-3.0-only (b)`), which `--explain` shows. A package without a
+  the license, the first is kept, a warning is logged, and the package records the disagreement as
+  `pixi:merge-conflict` (`license: MIT (a) vs GPL-3.0-only (b)`), which `--explain` shows. Different hashes are a
+  disagreement only when the purl names one file: a conda build, or a `file_name` qualifier. A bare
+  `pkg:pypi/six@1.17.0` is every file of that release, so one document recording the wheel's hash and another the
+  sdist's is not a conflict. A package without a
   purl is never merged with another. When two inputs reuse one id for different packages (two SPDX documents'
   `SPDXRef-Package-1`), the ids are made unique.
 - **The graph**: each input's root becomes a package of its own (kind `external`, `pkg:generic/<name>@<version>`)

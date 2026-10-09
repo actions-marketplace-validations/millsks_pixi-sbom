@@ -295,7 +295,10 @@ Everything in the recording is real output from a release build. What is staged 
 pinned back to a vulnerable 1.26.4, and drops the recorded OSV and CISA KEV responses the tests
 already use into the cache, so the run needs no network and takes the same time every time. It
 makes the same substitution as `workspace_with_vulnerable_urllib3` in `tests/cli.rs` and fails
-loudly if the fixture has drifted out from under it.
+loudly if the fixture has drifted out from under it. The 1.8 clips add three more inputs: the recorded FIRST EPSS
+answer written into the cache the way a lookup leaves it, the OpenVEX fixture trimmed to its one urllib3 statement
+(so the clip is not buried in warnings about statements this workspace has nothing for), and syft's document for a
+venv, to grade beside this one.
 
 The cache and the `pixi-sbom` symlink live *beside* the recorded directory rather than in it, so
 `ls` shows a workspace and not the scaffolding.
@@ -332,6 +335,11 @@ operator action, two runs.
 | `force_recreate` | false | Delete an existing tag and release of that version first, then recreate them. |
 
 A **pre-release is expressed in the version**, not by a separate flag: `1.0.0-rc.1` is one and `1.0.0` is not.
+
+**Write the release up in [What's new](whats-new.md)** in the pull request after the release, while it is fresh:
+one section per final release, saying what it means for someone using the tool, not what the commits were.
+`the_whats_new_page_covers_every_release_since_1_0` in `tests/cli.rs` fails the build until that section exists,
+and fails it for a section naming a release that does not. Release candidates do not get one; their final does.
 That is what semver already means by the suffix, and a flag could contradict the version it was attached to.
 
 What the two do, in order:

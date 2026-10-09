@@ -9006,3 +9006,375 @@ fn the_whole_examples_tree_scans_clean() {
         "one report per lockfile"
     );
 }
+
+/// The what's-new page has a section for every release since 1.0, and none for a release that
+/// does not exist: a release that ships without one fails the next build, which is how it gets
+/// written while the release is still fresh.
+#[test]
+fn the_whats_new_page_covers_every_release_since_1_0() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let version_of = |line: &str, prefix: &str| -> Option<(u32, u32, u32)> {
+        let rest = line.strip_prefix(prefix)?;
+        let version = rest.split_whitespace().next()?;
+        if version.contains('-') {
+            return None; // a release candidate
+        }
+        let mut parts = version.split('.').map(|p| p.parse::<u32>());
+        Some((parts.next()?.ok()?, parts.next()?.ok()?, parts.next()?.ok()?))
+    };
+    let changelog = std::fs::read_to_string(root.join("CHANGELOG.md")).unwrap();
+    let released: std::collections::BTreeSet<(u32, u32, u32)> = changelog
+        .lines()
+        .filter_map(|l| version_of(l, "## "))
+        .filter(|v| *v > (1, 0, 0))
+        .collect();
+    let page = std::fs::read_to_string(root.join("docs/whats-new.md")).unwrap();
+    let covered: std::collections::BTreeSet<(u32, u32, u32)> =
+        page.lines().filter_map(|l| version_of(l, "## ")).collect();
+    let missing: Vec<_> = released.difference(&covered).collect();
+    let invented: Vec<_> = covered.difference(&released).collect();
+    assert!(missing.is_empty(), "docs/whats-new.md has no section for {missing:?}");
+    assert!(
+        invented.is_empty(),
+        "docs/whats-new.md describes releases that do not exist: {invented:?}"
+    );
+    assert!(released.contains(&(1, 8, 1)), "the changelog was read");
+}
+
+/// Every `pixi sbom` line on the examples tour runs as written, in order, against a copy of
+/// `examples/projects`. A plain line succeeds; `# exit N` exits with N; `# needs the network`
+/// cannot be judged offline, so it is held to what offline can check: the flags parse and every
+/// example it names exists.
+#[test]
+fn the_examples_tour_runs_as_written() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let page = std::fs::read_to_string(root.join("docs/try-the-examples.md")).unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let examples = root.join("examples/projects");
+    for file in walkdir(&examples) {
+        let target = work
+            .path()
+            .join("examples/projects")
+            .join(file.strip_prefix(&examples).unwrap());
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::copy(&file, &target).unwrap();
+    }
+
+    let (mut ran, mut online) = (0, 0);
+    let mut in_shell = false;
+    for line in page.lines() {
+        if line.starts_with("```") {
+            in_shell = line == "```sh";
+            continue;
+        }
+        let Some(command) = line.strip_prefix("pixi sbom ").filter(|_| in_shell) else {
+            continue;
+        };
+        let (args, comment) = command.split_once('#').unwrap_or((command, ""));
+        let args: Vec<&str> = args.split_whitespace().collect();
+        let comment = comment.trim();
+        for path in args.iter().filter(|a| a.starts_with("examples/")) {
+            assert!(work.path().join(path).exists(), "{line}: {path} does not exist");
+        }
+        let assert = pixi_sbom()
+            .current_dir(work.path())
+            .env("PIXI_SBOM_OFFLINE", "1")
+            .env("PIXI_CACHE_DIR", work.path().join(".empty-pkgs-cache"))
+            .env("PIXI_SBOM_CACHE_DIR", work.path().join(".cache"))
+            .args(&args)
+            .assert();
+        let code = assert.get_output().status.code();
+        match comment {
+            "needs the network" => {
+                assert_ne!(code, Some(2), "{line}: a usage error");
+                online += 1;
+            }
+            "" => assert_eq!(
+                code,
+                Some(0),
+                "{line}: {}",
+                String::from_utf8_lossy(&assert.get_output().stderr)
+            ),
+            other => {
+                let expected: i32 = other
+                    .strip_prefix("exit ")
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or_else(|| panic!("{line}: an annotation this test does not know: {other}"));
+                assert_eq!(code, Some(expected), "{line}");
+            }
+        }
+        ran += 1;
+    }
+    assert!(ran >= 20, "the page's commands were found and run ({ran})");
+    assert!(online >= 5, "and the ones that need the network are marked ({online})");
+    // What the tour wrote is there for the next section to use.
+    for written in ["sboms", "app.cdx.json", "vendor.spdx.json"] {
+        assert!(work.path().join(written).exists(), "{written}");
+    }
+    assert_eq!(
+        std::fs::read_dir(work.path().join("sboms")).unwrap().count(),
+        4,
+        "one per environment"
+    );
+}
+
+/// Every recording tape has its GIF beside it, writes to that GIF, and the GIF is shown somewhere
+/// with a description: a clip recorded and never placed, or placed without alt text, fails here.
+#[test]
+fn every_recording_is_recorded_named_and_shown() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let assets = root.join("docs/assets");
+    let docs: String = ["README.md", "docs/cli.md", "docs/index.md"]
+        .iter()
+        .map(|f| std::fs::read_to_string(root.join(f)).unwrap())
+        .collect();
+    let mut tapes = 0;
+    for entry in std::fs::read_dir(&assets).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let Some(stem) = name.strip_suffix(".tape").filter(|s| !s.starts_with('_')) else {
+            continue;
+        };
+        tapes += 1;
+        let gif = format!("{stem}.gif");
+        assert!(
+            assets.join(&gif).is_file(),
+            "{name} has no {gif}: run `pixi run demo {stem}`"
+        );
+        let tape = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            tape.contains(&format!("Output \"docs/assets/{gif}\"")),
+            "{name} writes somewhere other than docs/assets/{gif}"
+        );
+        let shown = docs
+            .lines()
+            .find(|line| line.contains(&format!("assets/{gif}")))
+            .unwrap_or_else(|| panic!("{gif} is not shown in the README or the docs"));
+        assert!(
+            shown.contains("alt=\"") && !shown.contains("alt=\"\""),
+            "{gif} has no alt text: {shown}"
+        );
+    }
+    assert!(tapes >= 12, "the tapes were found ({tapes})");
+}
+
+/// A shell line as the field manual writes it: leading `VAR=value` assignments, then words, quotes
+/// honoured, and nothing after a pipe or a redirect (those belong to the shell, not to the tool).
+fn shell_words(line: &str) -> (Vec<(String, String)>, Vec<String>) {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote: Option<char> = None;
+    let mut started = false;
+    for c in line.chars() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), c) => word.push(c),
+            (None, '"' | '\'') => {
+                quote = Some(c);
+                started = true;
+            }
+            (None, '|' | '>') if !started => break,
+            (None, c) if c.is_whitespace() => {
+                if started {
+                    words.push(std::mem::take(&mut word));
+                    started = false;
+                }
+            }
+            (None, c) => {
+                word.push(c);
+                started = true;
+            }
+        }
+    }
+    if started {
+        words.push(word);
+    }
+    let mut env = Vec::new();
+    while let Some((key, value)) = words.first().and_then(|w| w.split_once('=')).filter(|(k, _)| {
+        !k.is_empty()
+            && k.chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+    }) {
+        env.push((key.to_string(), value.to_string()));
+        words.remove(0);
+    }
+    (env, words)
+}
+
+#[test]
+fn shell_words_split_like_the_shell_the_manual_is_written_for() {
+    let (env, words) =
+        shell_words(r#"PIXI_SBOM_OFFLINE=1 pixi sbom --ignore-vuln "CVE-1:not reachable" --output - | grep x > y"#);
+    assert_eq!(env, [("PIXI_SBOM_OFFLINE".to_string(), "1".to_string())]);
+    assert_eq!(
+        words,
+        ["pixi", "sbom", "--ignore-vuln", "CVE-1:not reachable", "--output", "-"]
+    );
+}
+
+/// Every `pixi sbom` line in the field manual runs as written, page by page in the order the
+/// navigation lists them, in one project that has what the playbooks name: a pixi workspace,
+/// a vendor's CycloneDX, SPDX and OpenVEX documents, and a pinned requirements.txt. A plain line
+/// succeeds; `# exit N` exits N; `# needs the network` is held offline to parsing and to the
+/// files it names existing.
+#[test]
+fn the_field_manual_runs_as_written() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let work = tempfile::tempdir().unwrap();
+    let project = root.join("examples/projects/pixi/01-django");
+    for file in walkdir(&project) {
+        let target = work.path().join(file.strip_prefix(&project).unwrap());
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::copy(&file, &target).unwrap();
+    }
+    for (from, to) in [
+        ("tests/fixtures/syft/app.cdx.json", "vendor.cdx.json"),
+        ("tests/fixtures/syft/app.spdx.json", "vendor.spdx.json"),
+        ("tests/fixtures/vex-in/vendor.openvex.json", "vendor.openvex.json"),
+        (
+            "examples/projects/requirements/01-django/requirements.txt",
+            "requirements.txt",
+        ),
+    ] {
+        std::fs::copy(root.join(from), work.path().join(to)).unwrap();
+    }
+
+    let nav = std::fs::read_to_string(root.join("mkdocs.yml")).unwrap();
+    let pages: Vec<&str> = nav
+        .lines()
+        .filter_map(|line| line.trim().split_once(": field-manual/").map(|(_, page)| page))
+        .collect();
+    assert!(pages.len() >= 8, "the field manual is in the navigation: {pages:?}");
+    let (mut ran, mut online) = (0, 0);
+    for page in pages {
+        let text = std::fs::read_to_string(root.join("docs/field-manual").join(page)).unwrap();
+        let mut in_shell = false;
+        for line in text.lines() {
+            if line.starts_with("```") {
+                in_shell = line == "```sh";
+                continue;
+            }
+            if !in_shell || !line.contains("pixi sbom ") {
+                continue;
+            }
+            let (command, comment) = line.split_once(" # ").unwrap_or((line, ""));
+            let (env, words) = shell_words(command);
+            let Some(args) = words.strip_prefix(&["pixi".to_string(), "sbom".to_string()]) else {
+                continue;
+            };
+            let mut cmd = pixi_sbom();
+            cmd.current_dir(work.path())
+                .env("PIXI_SBOM_OFFLINE", "1")
+                .env("PIXI_CACHE_DIR", work.path().join(".empty-pkgs-cache"))
+                .env("PIXI_SBOM_CACHE_DIR", work.path().join(".cache"))
+                .args(args);
+            for (key, value) in &env {
+                cmd.env(key, value);
+            }
+            let output = cmd.output().unwrap();
+            let code = output.status.code();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            match comment.trim() {
+                "needs the network" => {
+                    assert_ne!(code, Some(2), "{page}: {line}: a usage error\n{stderr}");
+                    assert!(
+                        !stderr.contains("No such file"),
+                        "{page}: {line}: a file it names is missing\n{stderr}"
+                    );
+                    online += 1;
+                }
+                "" => assert_eq!(code, Some(0), "{page}: {line}\n{stderr}"),
+                other => {
+                    let expected: i32 = other
+                        .strip_prefix("exit ")
+                        .and_then(|n| n.parse().ok())
+                        .unwrap_or_else(|| panic!("{page}: {line}: an annotation this test does not know: {other}"));
+                    assert_eq!(code, Some(expected), "{page}: {line}\n{stderr}");
+                }
+            }
+            ran += 1;
+        }
+    }
+    assert!(ran >= 25, "the playbooks' commands were found and run ({ran})");
+    assert!(online >= 10, "and the ones that need the network are marked ({online})");
+}
+
+/// The training lab runs as written, offline, from the cache it ships with: every `pixi sbom` line
+/// in order, `# exit N` honoured, and every line of each expected-output block found in what the
+/// command before it printed. A release that changes what a learner sees fails here rather than in
+/// a classroom.
+#[test]
+fn the_training_lab_runs_as_written_and_shows_what_it_says() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let page = std::fs::read_to_string(root.join("docs/lab.md")).unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let examples = root.join("examples");
+    for file in walkdir(&examples) {
+        let target = work.path().join("examples").join(file.strip_prefix(&examples).unwrap());
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::copy(&file, &target).unwrap();
+    }
+    let cache = work.path().join("examples/lab-cache");
+
+    // The page says when its answers were recorded, and the cache says the same.
+    let recorded = |text: &str, marker: &str| {
+        let at = text.find(marker).unwrap_or_else(|| panic!("no '{marker}'")) + marker.len();
+        text[at..at + 10].to_string()
+    };
+    let readme = std::fs::read_to_string(cache.join("README.md")).unwrap();
+    assert_eq!(
+        recorded(&page, "recorded into `examples/lab-cache/` on "),
+        recorded(&readme, "commands were run on "),
+        "docs/lab.md and examples/lab-cache disagree about when the cache was recorded: run `pixi run lab-cache`"
+    );
+
+    let (mut ran, mut checked) = (0, 0);
+    let mut block: Option<&str> = None;
+    let mut last = String::new();
+    for line in page.lines() {
+        if let Some(fence) = line.strip_prefix("```") {
+            block = match block {
+                Some(_) => None,
+                None => Some(fence),
+            };
+            continue;
+        }
+        match block {
+            Some("sh") if line.starts_with("pixi sbom ") => {
+                let (command, comment) = line.split_once(" # ").unwrap_or((line, ""));
+                let (_, words) = shell_words(command);
+                let output = pixi_sbom()
+                    .current_dir(work.path())
+                    .env("PIXI_SBOM_OFFLINE", "1")
+                    .env("PIXI_SBOM_CACHE_DIR", &cache)
+                    .env("PIXI_CACHE_DIR", work.path().join(".empty-pkgs-cache"))
+                    .env("COLUMNS", "120")
+                    .args(&words[2..])
+                    .output()
+                    .unwrap();
+                last = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let expected = comment
+                    .trim()
+                    .strip_prefix("exit ")
+                    .map_or(0, |n| n.parse::<i32>().unwrap());
+                assert_eq!(output.status.code(), Some(expected), "{line}\n{last}");
+                ran += 1;
+            }
+            Some("text") if !line.trim().is_empty() => {
+                assert!(
+                    last.contains(line.trim()),
+                    "docs/lab.md expects `{}` from the command before it, which printed:\n{last}",
+                    line.trim()
+                );
+                checked += 1;
+            }
+            _ => {}
+        }
+    }
+    assert!(ran >= 14, "the lab's commands were found and run ({ran})");
+    assert!(checked >= 12, "and its expected outputs checked ({checked})");
+}
