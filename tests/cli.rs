@@ -9673,7 +9673,20 @@ fn completion_offers_flags_values_and_paths() {
             .collect::<Vec<_>>()
     };
     assert_eq!(complete(&["--form"]), ["--format"]);
-    assert_eq!(complete(&["--format", ""]), ["cyclonedx", "spdx", "github"]);
+    assert_eq!(complete(&["--format", ""]), ["cyclonedx", "github", "spdx"]);
+    // Alphabetical, not the order the flags are declared in (#481).
+    assert_eq!(
+        complete(&["--fail-on-"]),
+        [
+            "--fail-on-diff",
+            "--fail-on-epss",
+            "--fail-on-kev",
+            "--fail-on-phantom",
+            "--fail-on-scorecard",
+            "--fail-on-severity",
+            "--fail-on-yanked"
+        ]
+    );
     let reports = complete(&["--report", ""]);
     for kind in ["packages", "licenses", "vulnerabilities", "quality"] {
         assert!(reports.iter().any(|r| r == kind), "--report offers {kind}: {reports:?}");
@@ -10060,4 +10073,28 @@ fn format_github_writes_a_dependency_submission_snapshot() {
         .assert()
         .success();
     assert!(dir.path().join("sbom.github.json").is_file(), "the default file name");
+}
+
+/// `--help` draws each section as a rule set apart by blank lines (#482), and piped it has no colour.
+#[test]
+fn help_sections_are_rules_set_apart_by_blank_lines() {
+    for flag in ["-h", "--help"] {
+        let assert = pixi_sbom().arg(flag).assert().success();
+        let help = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+        assert!(!help.contains('\u{1b}'), "{flag}: no colour when piped");
+        for section in [
+            "GENERAL",
+            "INPUT",
+            "ENVIRONMENT AND PLATFORM",
+            "VULNERABILITIES",
+            "DIAGNOSTICS",
+        ] {
+            assert!(
+                help.contains(&format!("\n\n\n── {section} ─")),
+                "{flag}: {section}\n{help}"
+            );
+        }
+        assert!(!help.contains("\nOptions:") && !help.contains("\nInput:"), "{flag}");
+        assert!(help.contains("Documentation: https://millsks.github.io/pixi-sbom/"));
+    }
 }
