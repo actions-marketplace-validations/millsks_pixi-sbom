@@ -594,7 +594,9 @@ library's compiled modules (`lib-dynload`, `DLLs`), so a Linux container's `/usr
 `WHEEL` tags); `win-64` for a `Lib/site-packages` layout; and only then the platform of the machine doing the
 scan. The document records `pixi:prefix` instead of `pixi:lockfile`, and for a venv or a Python installation
 `pixi:python-version`: the Python from `pyvenv.cfg`, or the newest `pythonX.Y` with a site-packages directory,
-made `X.Y.Z` by the `PY_VERSION` in `include/pythonX.Y/patchlevel.h` when the installation ships its headers. `--fetch-licenses` reads the license files from the directory each record says the
+made `X.Y.Z` by the `PY_VERSION` in `include/pythonX.Y/patchlevel.h` when the installation ships its headers. A conda package that installed a Python distribution gets that distribution's PyPI
+identity from the `dist-info` its record lists (`pixi:pypi-mapping=dist-info`), with no network and no
+`--pypi-mapping`; `--primary-purl pypi` makes it the identity scanners read. `--fetch-licenses` reads the license files from the directory each record says the
 package was extracted to (`extracted_package_dir`, the package cache), so it needs no network on the machine
 that installed the environment. The default output is `sbom.cdx.json` in the working directory, and the
 configuration file is looked up there too.
@@ -2061,6 +2063,9 @@ pixi sbom --format spdx --spec-version 3.0
 
 # Straight into a consumer, nothing written to disk
 pixi sbom --output - | grype
+
+# Native conda packages (openssl, libtiff, python) carry a CPE from the curated table by default,
+# so a CPE-matching scanner such as grype finds their advisories with no extra flag
 
 # Scannable: give conda-forge Python packages their PyPI identity and make it primary
 pixi sbom --pypi-mapping prefix --primary-purl pypi --output - | grype

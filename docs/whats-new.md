@@ -25,6 +25,26 @@ Since 1.0, pixi-sbom has:
 
 ## Unreleased
 
+**A plain Python installation lists its interpreter.** `--prefix` on a container's `/usr/local` listed only what
+pip installed, though most advisories against such an image are against Python itself. The interpreter is now a
+`python` component at its full version, with CPython's CPE. On `python:3.12-slim`, Grype finds 8 CPython
+vulnerabilities in the document that it found none of before.
+
+**`--prefix` reads a conda package's PyPI identity from what it installed, offline.** A conda-installed Django,
+Pillow or sqlparse had only its `pkg:conda` purl unless `--pypi-mapping prefix` downloaded the name mapping. The
+`dist-info` the package put in site-packages already names the PyPI project and version, and the conda record says
+which package installed it, so the identity is now read from disk. On an installed Django environment with
+`--primary-purl pypi`, Grype finds 94 vulnerabilities with no network, against 82 from syft's SBOM of the same
+environment.
+
+**Native conda packages carry a CPE, so Grype finds their advisories.** openssl, libtiff, sqlite, python and about
+eighty other native libraries from a conda channel have only a `pkg:conda` purl, which no advisory database
+indexes, so a CPE-matching scanner reported nothing for them. They now carry the CPE NVD uses, from a curated table,
+in CycloneDX, SPDX 2.3 and SPDX 3.0.1, by default. On the Django example, Grype's findings from the default
+document went from 0 to 36. A package that is not in the table gets no CPE: one is never guessed from a name.
+`--explain` shows where a CPE came from, and `--report quality` counts native packages a scanner cannot match
+(shown, not scored). See [CPEs for native conda packages](output-format.md#cpes-for-native-conda-packages).
+
 **`--prefix` lists each pip-installed package once in a conda-forge environment.** conda-forge's
 Python ships a `lib/python3.1` symlink to `lib/python3.11`, and packages installed with pip or uv
 were read through both, so each appeared twice with the same `bom-ref` or SPDXID. That made the

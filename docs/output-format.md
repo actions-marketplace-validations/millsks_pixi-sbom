@@ -158,15 +158,18 @@ and platform they always are. The `bom-ref` / `SPDXID` is always derived from th
 
 Vulnerability databases (OSV, GHSA) and the scanners built on them have no conda ecosystem: a `pkg:conda/numpy@...`
 purl matches nothing, so a conda-only Python environment scans as clean whatever it contains. Three sources supply a
-`pkg:pypi/...` purl for a conda package:
+`pkg:pypi/...` purl for a conda package, and a fourth for an installed environment:
 
 | Source | When | Recorded as |
 |---|---|---|
 | Lockfile `purls:` | pixi writes them for environments that have `pypi-dependencies`; an empty list means "not on PyPI" | `pixi:purl` property / extra `externalRefs` entry |
 | `--pypi-mapping prefix` | the [conda-forge mapping](https://conda-mapping.prefix.dev/compressed-v0/compressed_mapping.json) pixi itself uses, downloaded and cached for a day | as above, plus `pixi:pypi-mapping=prefix` |
 | `--pypi-mapping-file <PATH>` | an offline copy of that mapping (`{"<conda name>": "<pypi name>" \| ["..."] \| null}`) | as above, plus `pixi:pypi-mapping=file` |
+| The installed `dist-info` (`--prefix` only) | the conda record's `files` list the `site-packages/<name>-<version>.dist-info/METADATA` the package installed; its `Name` and `Version` are the PyPI project's. Read from disk, no network, no flag | as above, plus `pixi:pypi-mapping=dist-info` and `pixi:pypi-dist-info` (the directory, relative to the prefix) |
 
-The mapping is applied only to conda-forge binary packages whose lock entry has no `purls:` at all; the lockfile's own
+What a package installed outranks a name mapping: one with an identity from its `dist-info` is left alone by
+`--pypi-mapping`, which still answers for the packages that installed none. The mapping is applied only to
+conda-forge binary packages whose lock entry has no `purls:` at all; the lockfile's own
 answer, including an explicit empty list, is authoritative. The PyPI purl carries the conda package's version.
 
 pixi writes lockfile purls as bare names — `pkg:pypi/click?source=compressed-mapping`, with no version, because the
@@ -178,6 +181,31 @@ about it. Where the lock entry states a bare purl, its version is filled in from
 `--primary-purl pypi` then makes that PyPI purl the component's `purl` (first `externalRefs` entry in SPDX) and moves
 the conda purl to `pixi:purl`, because scanners only read the primary identity. With it, `grype` / `trivy` /
 `osv-scanner` report advisories for conda-installed Python packages.
+
+### CPEs for native conda packages
+
+A native library from a conda channel (openssl, libtiff, sqlite, python itself) has no PyPI identity, and its
+`pkg:conda` purl is in no advisory database. Scanners that match through NVD, such as Grype, match those by CPE
+instead. A channel's conda package whose name is in pixi-sbom's curated table (`data/cpe.toml`) gets one:
+
+| Format | Where |
+|---|---|
+| CycloneDX 1.6 / 1.7 | `component.cpe` |
+| SPDX 2.3 | an `externalRefs` entry: `referenceCategory: SECURITY`, `referenceType: cpe23Type` |
+| SPDX 3.0.1 | an `externalIdentifier` with `externalIdentifierType: cpe23` |
+
+The value is a CPE 2.3 formatted string, `cpe:2.3:a:<vendor>:<product>:<version>:*:*:*:*:*:*:*`, with the table's
+vendor and product as NVD spells them and the conda package's own version (characters a formatted string cannot
+carry unquoted are quoted with a backslash).
+
+**A package that is not in the table gets no CPE. pixi-sbom never guesses one from a name**: name guessing is where
+scanners' false positives on conda packages come from. Nothing is looked up at run time; the table is identity data,
+like the PyPI mapping. PyPI packages, and conda packages with a PyPI identity, are matched by their purl and get no
+CPE. `--explain <package>` shows the table entry a CPE came from, or that there is none, and `--report quality`
+counts native conda packages that have neither a CPE nor a purl a scanner matches.
+
+A CPE match is only as precise as the version: NVD cannot know that a conda-forge build carries a backported fix, so
+a finding on an older version may already be fixed in that build.
 
 ### Licenses
 
@@ -287,8 +315,12 @@ With `--prefix` the document describes an installed environment instead of a loc
 says `prefix <name>`, and pip-installed packages are located by a `file://` URL of their `dist-info` directory (or
 `<vcs>+<url>` for direct VCS installs, with `pixi:direct-url` and `pixi:source-rev`), carry `pixi:installer`, and
 have no hashes. Conda packages carry `pixi:extracted-package-dir`, where the record says the archive was
-unpacked. A venv or a plain Python installation has no `python` package to list, so the Python it was made with is
-the document's `pixi:python-version` (a CycloneDX metadata property, a line of the SPDX root package's comment).
+unpacked. The Python a venv or a plain installation was made with is the document's `pixi:python-version` (a
+CycloneDX metadata property, a line of the SPDX root package's comment). A plain installation, such as a container's
+`/usr/local`, also lists its interpreter as a component, since most advisories against it name the interpreter:
+`python` at that version, `pkg:generic/python@<version>`, with `pixi:interpreter=true`, and CPython's CPE when the
+full `X.Y.Z` is known (a CPE for a bare `X.Y` would match releases that already have the fix). A venv's interpreter
+lives outside it, and a conda environment lists its `python` package, so neither gets one.
 
 ### Documents derived from documents
 

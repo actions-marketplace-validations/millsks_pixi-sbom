@@ -170,6 +170,26 @@ the whole grid is one insta snapshot with notes on every limited cell. A reader 
 report changes the table, which is the point: such a gap shows as an empty column, never as a failure. Nothing leaves
 the machine; the test asserts the upstream saw every service's requests.
 
+### Against syft, through Grype (`pixi run grype-compare`)
+
+The acceptance test for replacing syft in front of Grype. For each corpus environment (`pixi/01-django`, a web
+stack; `pixi/04-data-analysis`, a scientific stack; `pixi/10-dev-tooling`, Rust binaries; and a pip venv of
+`requirements/02-flask`), `scripts/grype_compare.py` installs it, describes it with syft and with
+`pixi sbom --prefix --primary-purl pypi --embedded-sboms` (offline: everything pixi-sbom needs is on disk or in its
+own tables), and scans both documents with the same Grype and the same database. syft and Grype run through
+`pixi exec` at versions pinned in the script, so neither is a dependency of the project.
+
+Every conda or Python finding from syft's document must also come from pixi-sbom's. One that does not fails the
+run unless `tests/grype/exceptions.toml` lists it, for that environment, with a reason: an exception is for a
+difference that is right, such as a Grype match on a CPE syft guessed from a name for code the package does not
+contain. Findings only pixi-sbom's document produces are printed, not failed. The run prints the Grype database's
+build date, because findings change as advisories are published.
+
+It needs the network (installing the environments, Grype's database) and takes a few minutes, so it is not part of
+`pixi run ci`. The `Grype comparison` workflow runs it on pull requests that touch identity code, weekly, and on
+demand; `pixi run grype-compare --only django` runs one environment locally. `pixi run grype-compare-test` tests
+the comparison itself.
+
 ### Schema validation
 
 `tests/schemas/` contains the official CycloneDX 1.6 and 1.7 schemas (with the `spdx.schema.json`,
@@ -217,6 +237,21 @@ real document; the fixtures are small by design.
 - Dependencies: prefer what `rattler_lock` already pulls in; avoid git dependencies. `serde_json` uses
   `preserve_order` so keys are emitted in struct order.
 - Never print to stdout; logs go through `tracing` to stderr.
+
+## The CPE table
+
+`data/cpe.toml` maps a conda package name to NVD's `vendor:product`, and is compiled into the binary
+(`src/cpe.rs`). An entry is added only when the pair is the one NVD and Grype's database use for that code, and the
+conda package's version is spelled as upstream's:
+
+- Look the product up in Grype's database (`grype db status` says where it is; the `cpes` table joined to
+  `affected_cpe_handles` gives each vendor:product its advisory count), or in NVD's CPE dictionary. Use the vendor
+  that carries the advisories; where NVD splits a product between vendors that are not the same code, leave the
+  package out.
+- Leave out compiler runtimes and C libraries (gcc, glibc), whose advisories are for code a conda package does not
+  contain, and packages whose conda version differs from upstream's spelling.
+- `cpe::tests::every_entry_is_a_valid_vendor_and_product` checks the format; it cannot check that a pair is right,
+  which is why every entry needs that lookup. Scheduled checks that every entry still matches are #435.
 
 ## The GitHub Action
 

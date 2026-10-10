@@ -99,6 +99,9 @@ struct Record {
     noarch: Option<serde_json::Value>,
     #[serde(default)]
     extracted_package_dir: Option<String>,
+    /// What the package installed, relative to the prefix.
+    #[serde(default)]
+    files: Vec<String>,
 }
 
 /// What `pixi:declared-in` says of a package the user asked for by name: a dist-info with a
@@ -493,6 +496,17 @@ pub fn build_sbom(prefix: &Path, root: Root, platform: Option<&str>) -> Result<S
             *subdirs.entry(subdir.to_string()).or_default() += 1;
         }
         let mut package = conda_package(&record)?;
+        if let Some((purl, dist_info)) = installed_pypi_identity(prefix, &record) {
+            if !package.extra_purls.contains(&purl) {
+                package.extra_purls.push(purl);
+            }
+            // What is on disk outranks a downloaded name mapping, which then leaves it alone.
+            package.purls_from_lock = true;
+            package
+                .properties
+                .insert(crate::mapping::MAPPING_PROPERTY.to_string(), "dist-info".into());
+            package.properties.insert(DIST_INFO_PROPERTY.to_string(), dist_info);
+        }
         if requested.contains(&package.name.to_lowercase()) {
             mark_requested(&mut package);
         }
@@ -508,6 +522,37 @@ pub fn build_sbom(prefix: &Path, root: Root, platform: Option<&str>) -> Result<S
         };
         packages.push(package);
         declared.push(DeclaredDeps::Pypi(requires));
+    }
+    // A plain installation (a container's /usr/local) has no package that is the interpreter,
+    // though the interpreter is what most advisories against it name. A venv's is outside it,
+    // and a conda environment lists its `python` package.
+    if layout == Layout::Python
+        && let Some(version) = interpreter(prefix)
+        && let Ok(purl) = purl::generic("python", &version)
+    {
+        packages.push(Package {
+            id: purl.clone(),
+            name: "python".into(),
+            version: Some(version),
+            kind: PackageKind::External,
+            purl,
+            supplier: None,
+            extra_purls: Vec::new(),
+            purls_from_lock: false,
+            location: String::new(),
+            sha256: None,
+            md5: None,
+            license: None,
+            license_files: Vec::new(),
+            description: Some("The Python interpreter of this installation".into()),
+            homepage: None,
+            repository: None,
+            documentation: None,
+            yanked: None,
+            properties: BTreeMap::from([(INTERPRETER_PROPERTY.to_string(), "true".to_string())]),
+            dependencies: Vec::new(),
+        });
+        declared.push(DeclaredDeps::Pypi(Vec::new()));
     }
 
     link_dependencies(&mut packages, &declared);
@@ -651,6 +696,40 @@ fn conda_package(record: &Record) -> Result<Package, PrefixError> {
         properties,
         dependencies: Vec::new(),
     })
+}
+
+/// Marks the component a plain Python installation's interpreter is described by.
+pub const INTERPRETER_PROPERTY: &str = "pixi:interpreter";
+
+/// The installed dist-info a conda package's PyPI identity was read from, relative to the prefix.
+pub const DIST_INFO_PROPERTY: &str = "pixi:pypi-dist-info";
+
+/// A conda package's PyPI identity from the `dist-info` it installed: the record's `files` name
+/// the `METADATA`, and its `Name` and `Version` are the PyPI project's. No network, and no name
+/// mapping that could be out of date. Returns the purl and the dist-info directory.
+fn installed_pypi_identity(prefix: &Path, record: &Record) -> Option<(String, String)> {
+    let mut metadata: Vec<&String> = record
+        .files
+        .iter()
+        .filter(|file| {
+            let file = file.replace('\\', "/");
+            file.ends_with(".dist-info/METADATA") && file.contains("site-packages/")
+        })
+        .collect();
+    metadata.sort();
+    let file = metadata.first()?;
+    let text = std::fs::read_to_string(prefix.join(file)).ok()?;
+    let headers = wheel::parse_headers(&text);
+    let first = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.first())
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    let purl = purl::pypi(&first("name")?, &first("version")?).ok()?;
+    let dist_info = file.replace('\\', "/").trim_end_matches("/METADATA").to_string();
+    Some((purl, dist_info))
 }
 
 /// Every `*.dist-info` directory under the environment's site-packages, whichever layout the
@@ -930,6 +1009,58 @@ mod tests {
         assert_eq!(object_platform(b"#!/bin/sh\n"), None);
     }
 
+    /// A Python package conda installed carries its PyPI identity from the dist-info it put in
+    /// site-packages: no network, no mapping. The dist-info is not listed again as a PyPI package.
+    #[test]
+    fn a_conda_python_package_gets_its_pypi_identity_from_its_installed_dist_info() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = dir.path();
+        std::fs::create_dir_all(env.join("conda-meta")).unwrap();
+        let dist = "lib/python3.12/site-packages/Django-3.2.12.dist-info";
+        std::fs::create_dir_all(env.join(dist)).unwrap();
+        std::fs::write(
+            env.join(dist).join("METADATA"),
+            "Metadata-Version: 2.1\nName: Django\nVersion: 3.2.12\n",
+        )
+        .unwrap();
+        std::fs::write(env.join(dist).join("INSTALLER"), "conda\n").unwrap();
+        let record = serde_json::json!({
+            "name": "django", "version": "3.2.12", "build": "pyhd8ed1ab_0", "subdir": "noarch",
+            "channel": "https://conda.anaconda.org/conda-forge",
+            "files": [format!("{dist}/INSTALLER"), format!("{dist}/METADATA"), "lib/python3.12/site-packages/django/__init__.py"],
+        });
+        std::fs::write(
+            env.join("conda-meta/django-3.2.12-pyhd8ed1ab_0.json"),
+            record.to_string(),
+        )
+        .unwrap();
+        let record = serde_json::json!({"name": "zlib", "version": "1.3.1", "build": "h0", "subdir": "linux-64",
+            "files": ["lib/libz.so.1"]});
+        std::fs::write(env.join("conda-meta/zlib-1.3.1-h0.json"), record.to_string()).unwrap();
+
+        let sbom = build_sbom(env, Root::default(), None).unwrap();
+        let names: Vec<&str> = sbom.packages.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(
+            names.iter().filter(|n| n.eq_ignore_ascii_case("django")).count(),
+            1,
+            "{names:?}"
+        );
+        let django = sbom.packages.iter().find(|p| p.name == "django").unwrap();
+        assert_eq!(django.extra_purls, ["pkg:pypi/django@3.2.12"]);
+        assert_eq!(django.properties[crate::mapping::MAPPING_PROPERTY], "dist-info");
+        assert_eq!(django.properties[DIST_INFO_PROPERTY], dist);
+        let explained = crate::explain::facts(django, &sbom, crate::explain::Context::default());
+        let other = explained.iter().find(|f| f.label == "other purls").unwrap();
+        assert_eq!(
+            other.source.as_deref(),
+            Some(format!("the installed dist-info ({dist})").as_str())
+        );
+
+        let zlib = sbom.packages.iter().find(|p| p.name == "zlib").unwrap();
+        assert!(zlib.extra_purls.is_empty(), "no dist-info, no PyPI identity");
+        assert!(!zlib.purls_from_lock, "so a mapping may still answer for it");
+    }
+
     /// A Linux arm64 container's `/usr/local`, scanned from any machine: the platform is the
     /// interpreter's, not the scanner's, and the version is the full one its headers state.
     #[test]
@@ -965,6 +1096,20 @@ mod tests {
             Some("3.12.15"),
             "3.12 over 3.9, then patchlevel.h"
         );
+        let python = sbom
+            .packages
+            .iter()
+            .find(|p| p.name == "python")
+            .expect("the interpreter is listed");
+        assert_eq!(python.purl, "pkg:generic/python@3.12.15");
+        assert_eq!(python.kind, PackageKind::External);
+        assert_eq!(
+            crate::cpe::for_package(python).as_deref(),
+            Some("cpe:2.3:a:python:python:3.12.15:*:*:*:*:*:*:*")
+        );
+        let explained = crate::explain::facts(python, &sbom, crate::explain::Context::default());
+        let cpe = explained.iter().find(|f| f.label == "cpe").unwrap();
+        assert!(cpe.source.as_deref().unwrap().contains("CPython"), "{cpe:?}");
 
         std::fs::remove_file(local.join("include/python3.12/patchlevel.h")).unwrap();
         let sbom = build_sbom(local, Root::default(), None).unwrap();
@@ -973,6 +1118,9 @@ mod tests {
             Some("3.12"),
             "without headers, the directory's X.Y"
         );
+        let python = sbom.packages.iter().find(|p| p.name == "python").unwrap();
+        assert_eq!(python.purl, "pkg:generic/python@3.12");
+        assert_eq!(crate::cpe::for_package(python), None, "no CPE for a bare X.Y");
     }
 
     #[test]
@@ -1035,8 +1183,13 @@ mod tests {
         let names: Vec<&str> = plain.packages.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(
             names,
-            ["numpy", "six"],
-            "INSTALLER conda decides nothing without conda records"
+            ["numpy", "six", "python"],
+            "INSTALLER conda decides nothing without conda records; the interpreter is listed"
+        );
+        assert_eq!(
+            posix.packages.iter().filter(|p| p.name == "python").count(),
+            0,
+            "a venv's interpreter is outside it: its version is in pixi:python-version"
         );
         assert_eq!(
             plain.interpreter.as_deref(),
