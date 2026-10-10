@@ -8773,9 +8773,63 @@ fn the_quality_report_grades_a_complete_and_a_sparse_document() {
     );
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["report"], "quality");
-    assert_eq!(report["summary"]["overall"], 51);
+    assert_eq!(
+        report["summary"]["overall"], 62,
+        "syft's authors are suppliers, its CPEs identifiers"
+    );
     let rows = report["quality"].as_array().unwrap();
     assert_eq!(rows.len(), 10);
+    // The same tool's SPDX: `supplier: Person: ...` and `cpe23Type` references are read too.
+    let spdx = tests_dir().join("fixtures/syft/app.spdx.json");
+    let output = run(
+        work.path(),
+        &[
+            "--from-sbom",
+            spdx.to_str().unwrap(),
+            "--report",
+            "quality",
+            "--report-format",
+            "json",
+        ],
+    );
+    let spdx: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let element = |name: &str| {
+        spdx["quality"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["element"] == name)
+            .unwrap()
+            .clone()
+    };
+    assert!(
+        element("supplier")["score"].as_u64().unwrap() > 0,
+        "{}",
+        element("supplier")
+    );
+    assert!(
+        element("unique identifier")["detail"]
+            .as_str()
+            .unwrap()
+            .contains("a purl or a CPE"),
+        "{}",
+        element("unique identifier")
+    );
+
+    // Read and written again, the CPEs stay CPEs and the suppliers suppliers.
+    let syft = tests_dir().join("fixtures/syft/app.cdx.json");
+    let output = run(work.path(), &["--from-sbom", syft.to_str().unwrap(), "--output", "-"]);
+    let written: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let components = written["components"].as_array().unwrap();
+    assert_eq!(components.iter().filter(|c| c["cpe"].is_string()).count(), 15);
+    assert_eq!(components.iter().filter(|c| c["supplier"].is_object()).count(), 9);
+    assert!(
+        !components
+            .iter()
+            .flat_map(|c| c["properties"].as_array().into_iter().flatten())
+            .any(|p| p["name"] == "cpe"),
+        "the CPE is a field, never a property"
+    );
     let informational: Vec<&Value> = rows
         .iter()
         .filter(|r| r["informational"] == true)
@@ -9714,4 +9768,96 @@ fn native_conda_packages_carry_a_cpe_in_every_format() {
         text.contains(&format!(r#""externalIdentifierType":"cpe23","identifier":"{libtiff}""#)),
         "SPDX 3: a cpe23 external identifier"
     );
+}
+
+/// The same installed environment at two paths gives the same document, apart from when it was
+/// written and its serial number: nothing in it says where on the machine the environment, or
+/// the package cache it was extracted from, lives.
+#[test]
+fn an_installed_environment_documents_the_same_wherever_it_is() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/prefix");
+    let describe = |at: &Path| -> Value {
+        for file in walkdir(&fixture) {
+            let target = at.join(file.strip_prefix(&fixture).unwrap());
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::copy(&file, &target).unwrap();
+        }
+        let assert = pixi_sbom()
+            .current_dir(dir.path())
+            .env("PIXI_CACHE_DIR", dir.path().join("empty-pkgs-cache"))
+            .env("PIXI_SBOM_CACHE_DIR", dir.path().join("sbom-cache"))
+            .env("PIXI_SBOM_OFFLINE", "1")
+            .arg("--prefix")
+            .arg(at)
+            .args(["-p", "linux-64", "--output", "-"])
+            .assert()
+            .success();
+        let mut doc: Value = serde_json::from_slice(&assert.get_output().stdout).unwrap();
+        let text = doc.to_string();
+        assert!(
+            !text.contains(&*at.to_string_lossy()),
+            "the document names its path:\n{text}"
+        );
+        assert!(
+            !text.contains("/opt/pkgs"),
+            "the document names the package cache's path"
+        );
+        doc["metadata"]["timestamp"] = Value::Null;
+        doc["serialNumber"] = Value::Null;
+        doc
+    };
+    let first = describe(&dir.path().join("one/env"));
+    let second = describe(&dir.path().join("another/place/env"));
+    assert_eq!(first, second);
+    let python = first["components"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "python")
+        .unwrap();
+    let extracted = python["properties"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "pixi:extracted-package-dir")
+        .unwrap();
+    assert_eq!(
+        extracted["value"], "python-3.12.14-h5f976f7_3_cpython",
+        "the cache entry's name"
+    );
+}
+
+/// The pixi-sbom column of the lockfile table on docs/syft.md: each row's package and hash counts
+/// are what pixi-sbom writes for that lockfile, offline, for linux-64.
+#[test]
+fn the_syft_page_counts_are_what_pixi_sbom_writes() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let page = std::fs::read_to_string(root.join("docs/syft.md")).unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let mut checked = 0;
+    for line in page.lines().filter(|l| l.starts_with("| `examples/")) {
+        let cells: Vec<&str> = line.trim_matches('|').split('|').map(str::trim).collect();
+        let lockfile = cells[0].trim_matches('`');
+        let (packages, hashed): (usize, usize) = (cells[2].parse().unwrap(), cells[3].parse().unwrap());
+        let assert = pixi_sbom()
+            .current_dir(work.path())
+            .env("PIXI_SBOM_OFFLINE", "1")
+            .env("PIXI_SBOM_CACHE_DIR", work.path().join("cache"))
+            .arg("--lockfile")
+            .arg(root.join(lockfile))
+            .args(["-p", "linux-64", "--output", "-"])
+            .assert()
+            .success();
+        let doc: Value = serde_json::from_slice(&assert.get_output().stdout).unwrap();
+        let components = doc["components"].as_array().unwrap();
+        assert_eq!(components.len(), packages, "{lockfile}: packages");
+        assert_eq!(
+            components.iter().filter(|c| c["hashes"].is_array()).count(),
+            hashed,
+            "{lockfile}: hashes"
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, 3, "the table's rows were found");
 }

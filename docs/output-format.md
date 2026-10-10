@@ -331,10 +331,12 @@ they are different copies of the code. `--report diff` leaves vendored copies ou
 
 With `--prefix` the document describes an installed environment instead of a lockfile: the metadata property is
 `pixi:prefix` (the environment directory's name) rather than `pixi:lockfile`, the SPDX root package's source info
-says `prefix <name>`, and pip-installed packages are located by a `file://` URL of their `dist-info` directory (or
-`<vcs>+<url>` for direct VCS installs, with `pixi:direct-url` and `pixi:source-rev`), carry `pixi:installer`, and
-have no hashes. Conda packages carry `pixi:extracted-package-dir`, where the record says the archive was
-unpacked. The Python a venv or a plain installation was made with is the document's `pixi:python-version` (a
+says `prefix <name>`, and pip-installed packages carry `pixi:installer` and have no hashes (a direct VCS install is
+located by `<vcs>+<url>`, with `pixi:direct-url` and `pixi:source-rev`). Conda packages carry
+`pixi:extracted-package-dir`: the name of the directory in the package cache the record says the archive was unpacked
+to. **Nothing in the document says where on the machine the environment or the package cache is**: the same
+environment at two paths, or on two machines, gives the same document apart from its timestamp and serial number. A
+pip package's local `dist-info` directory is not a download location and is not recorded as one. The Python a venv or a plain installation was made with is the document's `pixi:python-version` (a
 CycloneDX metadata property, a line of the SPDX root package's comment). A plain installation, such as a container's
 `/usr/local`, also lists its interpreter as a component, since most advisories against it name the interpreter:
 `python` at that version, `pkg:generic/python@<version>`, with `pixi:interpreter=true`, and CPython's CPE when the
@@ -347,7 +349,10 @@ With `--from-sbom` the document describes what another document described: the m
 `pixi:source-document` — the source's CycloneDX serial number or SPDX document namespace — rather than
 `pixi:lockfile`, and the SPDX root package's source info says `document <identity>`. Everything the source records
 is carried over, including the `pixi:*` properties, so a document this tool wrote round-trips unchanged; a package
-whose purl is neither `pkg:conda` nor `pkg:pypi`, or which has no purl, gets `pixi:kind=external`.
+whose purl is neither `pkg:conda` nor `pkg:pypi`, or which has no purl, gets `pixi:kind=external`. Another tool's
+facts are read in their standard places: the supplier from CycloneDX `supplier`, `manufacturer`, `authors` or
+`author`, or SPDX `supplier` or `originator` (the name, without `Person:` / `Organization:` or an email); and the CPE
+from CycloneDX `cpe` or an SPDX `cpe23Type` / `cpe22Type` reference, written back to the output's CPE field.
 
 Merged (`--from-sbom` more than once, or `--scan --merge`), the metadata property lists every input, and each
 package carries `pixi:source-document` naming the inputs it came from. Each input's root is a component of its own
