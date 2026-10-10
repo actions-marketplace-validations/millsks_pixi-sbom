@@ -180,7 +180,9 @@ about it. Where the lock entry states a bare purl, its version is filled in from
 
 `--primary-purl pypi` then makes that PyPI purl the component's `purl` (first `externalRefs` entry in SPDX) and moves
 the conda purl to `pixi:purl`, because scanners only read the primary identity. With it, `grype` / `trivy` /
-`osv-scanner` report advisories for conda-installed Python packages.
+`osv-scanner` report advisories for conda-installed Python packages. Without it, a run that leaves PyPI identities
+where scanners cannot see them warns once on stderr; [Scanning with Grype](ci-recipes.md#scanning-with-grype) has the
+recommended commands and the configuration key.
 
 ### CPEs for native conda packages
 
@@ -342,6 +344,11 @@ CycloneDX metadata property, a line of the SPDX root package's comment). A plain
 `python` at that version, `pkg:generic/python@<version>`, with `pixi:interpreter=true`, and CPython's CPE when the
 full `X.Y.Z` is known (a CPE for a bare `X.Y` would match releases that already have the fix). A venv's interpreter
 lives outside it, and a conda environment lists its `python` package, so neither gets one.
+
+With `--verify-files`, each conda package whose record lists file hashes carries `pixi:verified-files`, the number of
+its files checked, and where they apply `pixi:modified-files` and `pixi:missing-files` (comma-separated paths relative
+to the environment) and `pixi:regenerated-bytecode` (how many `.pyc` files Python has rewritten, which is not a
+failure). See [Has anything changed since installation](cli.md#has-anything-changed-since-installation).
 
 ### Documents derived from documents
 

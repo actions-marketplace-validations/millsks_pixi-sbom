@@ -458,6 +458,11 @@ pub struct Args {
     #[arg(long, value_enum, default_value_t = PrimaryPurl::Conda)]
     pub primary_purl: PrimaryPurl,
 
+    /// Whether `--primary-purl` or the `primary-purl` key chose it, rather than the default: a
+    /// chosen `conda` is a decision, the default one gets a warning when scanners would miss packages.
+    #[arg(skip)]
+    pub primary_purl_chosen: bool,
+
     /// Fetch the license of every package, conda and PyPI alike, where the lockfile has none,
     /// plus the names of the license files it ships. Sources are the local package cache
     /// first, then the package index. Failures are logged and the run continues.
@@ -479,6 +484,13 @@ pub struct Args {
     /// the packages may be there for another reason.
     #[arg(long, requires = "prefix")]
     pub infer_extras: bool,
+
+    /// With --prefix, hash every file each conda package installed and compare it with its
+    /// conda-meta record. Modified and missing files are recorded (pixi:modified-files,
+    /// pixi:missing-files) and end the run with exit code 11; .pyc files Python regenerated are
+    /// counted, never a failure. --report files lists them.
+    #[arg(long, requires = "prefix")]
+    pub verify_files: bool,
 
     /// Deprecated alias for --fetch-licenses (it used to cover PyPI packages only).
     #[arg(long, hide = true)]

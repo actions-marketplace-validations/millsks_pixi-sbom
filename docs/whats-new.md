@@ -25,6 +25,19 @@ Since 1.0, pixi-sbom has:
 
 ## Unreleased
 
+**`--verify-files` checks an installed conda environment against itself.** conda-meta records the SHA-256 of every
+file a package installed; with `--prefix`, `--verify-files` hashes each one and records modified and missing files on
+the package (`pixi:modified-files`, `pixi:missing-files`), and `--report files` lists them. Either ends the run with
+the new exit code 11. `.pyc` files Python regenerated are counted but never fail it. It is offline and opt-in: the
+Django example's 13,241 files take about 1.5 s.
+
+**pixi-sbom says when a scanner would miss packages.** Grype and other scanners read only a package's primary purl,
+and by default a conda-installed Python package's primary purl is `pkg:conda`, which no advisory database indexes: on
+the Django example Grype found none of django's 27 vulnerabilities. A run now warns once when that applies, naming
+`--primary-purl pypi` and the `primary-purl` configuration key; setting either, to `pypi` or `conda`, silences it.
+`--report quality` counts the same packages in a new, unscored **PyPI identity** row, and the CI recipes have a
+[Scanning with Grype](ci-recipes.md#scanning-with-grype) section. The default changes in 2.0 (#478).
+
 **An installed environment's document no longer names paths on the machine that made it.** `--prefix` recorded a
 pip package's `file:///…/site-packages/…dist-info` as its location, and each conda package's extraction directory
 as a full path into the user's cache (`/Users/<name>/Library/Caches/rattler/…`). The first is dropped, the second

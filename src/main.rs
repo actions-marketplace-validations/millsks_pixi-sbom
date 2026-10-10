@@ -8,7 +8,7 @@ use pixi_sbom::{
     auditable, batch, cache, cli, concurrency, condaarchive, condalock, config, diff, discover, doctor, embedded, epss,
     explain, explicit, filter, format, fromsbom, http, imports, kev, license, lock, manifest, mapping, merge, mirror,
     model, osv, outdated, pdm, phantom, pkgcache, poetry, policy, prefix, progress, pylock, pypi, report, requirements,
-    scorecard, style, timings, uv, vexin, vulnpolicy, wheel,
+    scorecard, style, timings, uv, verify, vexin, vulnpolicy, wheel,
 };
 
 /// The system allocator on macOS and Windows is slow under the many small allocations a
@@ -42,6 +42,7 @@ fn main() -> Result<()> {
     let started = std::time::Instant::now();
     let matches = cli::Args::command().get_matches();
     let mut args = cli::Args::from_arg_matches(&matches).into_diagnostic()?;
+    args.primary_purl_chosen = matches.value_source("primary_purl") == Some(clap::parser::ValueSource::CommandLine);
     let (log_format, unknown_log_format) =
         cli::LogFormat::resolve(args.log_format, std::env::var(cli::LOG_FORMAT_ENV).ok().as_deref());
     init_tracing(&args, log_format);
@@ -378,6 +379,7 @@ fn main() -> Result<()> {
     let mut diff_hits: Vec<(String, String, String)> = Vec::new();
     let mut low_scores: Vec<(String, String, String)> = Vec::new();
     let mut low_quality: Vec<(String, String, String)> = Vec::new();
+    let mut changed_files: Vec<(String, String, String)> = Vec::new();
     let assume_used = parse_globs(&args.assume_used, "--assume-used");
     let explain_patterns = parse_globs(&args.explain, "--explain");
     let explain_context = explain::Context {
@@ -458,6 +460,32 @@ fn main() -> Result<()> {
         if args.primary_purl == cli::PrimaryPurl::Pypi {
             let switched = mapping::prefer_pypi_purl(&mut sbom);
             tracing::info!(switched, "made PyPI purls primary");
+        }
+        warn_unscannable_pypi(&sbom, &args);
+        if let Some(dir) = args.prefix.as_deref()
+            && (args.verify_files || args.report == Some(report::ReportKind::Files))
+        {
+            let results = verify::verify(dir);
+            let failing = verify::attach(&mut sbom, &results);
+            tracing::info!(
+                packages = results.len(),
+                failing,
+                "verified installed files against conda-meta"
+            );
+            for package in &sbom.packages {
+                for (property, state) in [
+                    (verify::MODIFIED_PROPERTY, "modified"),
+                    (verify::MISSING_PROPERTY, "missing"),
+                ] {
+                    for path in package.properties.get(property).into_iter().flat_map(|v| v.split(", ")) {
+                        changed_files.push((
+                            sbom.environment.clone(),
+                            sbom.platform.clone(),
+                            format!("{state}: {path} ({})", package.name),
+                        ));
+                    }
+                }
+            }
         }
         match &shared {
             // Already looked up for every document at once; what is left is only what this
@@ -904,6 +932,22 @@ fn main() -> Result<()> {
         }
         let _ = stderr.flush();
     }
+    if !changed_files.is_empty() {
+        let mut stderr = std::io::stderr().lock();
+        let _ = writeln!(
+            stderr,
+            "Installed files that differ from conda-meta: {} (--report files lists them):",
+            changed_files.len()
+        );
+        for (environment, platform, line) in &changed_files {
+            let _ = if targets.len() > 1 {
+                writeln!(stderr, "  [{environment}/{platform}] {line}")
+            } else {
+                writeln!(stderr, "  {line}")
+            };
+        }
+        let _ = stderr.flush();
+    }
     if !low_quality.is_empty() {
         let mut stderr = std::io::stderr().lock();
         let min = args.min_quality.unwrap_or_default();
@@ -997,6 +1041,7 @@ fn main() -> Result<()> {
         Gate::new("the comparison", diff_hits.len(), diff::DIFF_EXIT_CODE),
         Gate::new("scorecards", low_scores.len(), SCORECARD_EXIT_CODE),
         Gate::new("quality", low_quality.len(), pixi_sbom::quality::QUALITY_EXIT_CODE),
+        Gate::new("installed files", changed_files.len(), verify::MODIFIED_EXIT_CODE),
     ];
     let failed: Vec<&Gate> = failed.iter().filter(|gate| gate.count > 0).collect();
     if let Some(first) = failed.first() {
@@ -1179,6 +1224,12 @@ fn validate(args: &cli::Args) {
         usage(
             MissingRequiredArgument,
             "'--scorecard' needs '--fetch-licenses', which is what collects the repository URLs",
+        );
+    }
+    if args.report == Some(report::ReportKind::Files) && args.prefix.is_none() {
+        usage(
+            MissingRequiredArgument,
+            "'--report files' needs '--prefix <DIR>': only an installed environment has files to check",
         );
     }
     if args.report == Some(report::ReportKind::Scorecard) && !args.scorecard {
@@ -1421,6 +1472,25 @@ fn environment_banner() -> String {
 const FEATURES: &str = "rustls, gzip, platform-verifier, socks-proxy, win-system-proxy";
 #[cfg(not(windows))]
 const FEATURES: &str = "rustls, gzip, platform-verifier, socks-proxy, win-system-proxy: n/a";
+
+/// Scanners read only a package's primary purl, so with the default `--primary-purl conda` a conda
+/// package's PyPI identity is invisible to them and its advisories go unreported (#449). Said once
+/// a run, and not at all once the setting is chosen, `conda` included.
+fn warn_unscannable_pypi(sbom: &model::Sbom, args: &cli::Args) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if args.primary_purl_chosen || args.primary_purl != cli::PrimaryPurl::Conda {
+        return;
+    }
+    let hidden = mapping::hidden_pypi_identities(sbom);
+    if hidden > 0 && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            packages = hidden,
+            "vulnerability scanners read only the primary purl, so they will not match these conda packages \
+             by their PyPI identity; set --primary-purl pypi (or primary-purl = \"pypi\" in pixi-sbom-config.toml) \
+             to scan them, or --primary-purl conda to keep conda purls and silence this"
+        );
+    }
+}
 
 /// Exit code for `--doctor` when an upstream could not be reached.
 const DOCTOR_EXIT_CODE: i32 = 1;
