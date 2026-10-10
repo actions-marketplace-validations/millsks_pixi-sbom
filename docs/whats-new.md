@@ -22,6 +22,14 @@ Since 1.0, pixi-sbom has:
 - **Learned to work on restricted networks.** Every upstream can point at a mirror, pixi's own
   credentials are used, and `--doctor` says which host is the problem.
 
+## Unreleased
+
+**Tab completion for `pixi-sbom`.** Flags, the values they take and file paths complete in bash,
+zsh, fish, PowerShell and elvish after one line in the shell's startup file
+([shell completion](installation.md#shell-completion)). pixi itself doesn't yet hand an
+extension's arguments to the extension (that has been asked for), so `pixi sbom` with a space
+completes through a short snippet per shell from the same page, which CI runs in each shell.
+
 ## 1.8.2
 
 **Merging SBOMs no longer flags two files of one PyPI release as a conflict.** A bare

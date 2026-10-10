@@ -1,6 +1,6 @@
 [package]
 name = "pixi-sbom"
-version = "1.8.2"
+version = "1.9.0-rc.1"
 edition = "2024"
 # Proved rather than asserted: `pixi run -e msrv msrv-check` builds on exactly this toolchain,
 # and CI runs it. Raised from 1.85, which had never been true — let-chains, which this crate
@@ -112,6 +112,7 @@ ureq = { version = "3.4.2", default-features = false, features = [
 ] }
 uuid = { version = "1.26.1", features = ["v5"] }
 zstd = "0.14.0"
+clap_complete = { version = "=4.6.11", features = ["unstable-dynamic"] }
 
 # A proxy set only in the Windows settings, with no environment variable, is invisible without
 # this; it costs nothing on the other platforms because it is not built there.
