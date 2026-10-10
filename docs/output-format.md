@@ -333,6 +333,19 @@ binary, `pixi:cargo-source` (`crates.io`, `git`, `local`, ...), and an edge from
 its program was built from. Crates that only built the program (`kind: build`) are not in it and are left out.
 Because the purls are `pkg:cargo`, `--vulnerabilities osv` covers them through RUSTSEC.
 
+### Go modules inside a binary
+
+Every Go binary built with module support carries its build information: the Go version and each module compiled
+in, what `go version -m` prints. conda-forge builds its Go packages (`gh`, `go-yq`, `terraform`) from source, so
+with `--prefix` and `--embedded-sboms` those modules are read out of the binaries the environment installed and
+attached like any other embedded component: `pixi:kind=embedded`, a `pkg:golang/<module>@<version>` purl (after any
+`=>` replacement), and `pixi:embedded-sbom=go-buildinfo:<file>`. The Go standard library is a component too,
+`stdlib` at version `go1.27.1` with the purl `pkg:golang/stdlib@1.27.1`, as Syft records it, so advisories against
+the Go runtime match. Go records which modules are in the binary, not which needs which, so they hang off the
+binary's main module when it has a released version, and off the conda package when it is a source build
+(`(devel)`). OSV and Grype both index Go advisories. Binaries built before Go 1.18, whose build information is in an
+older layout, are passed over.
+
 ### Vendored Python distributions
 
 Some packages ship other Python distributions inside themselves, each with its own `dist-info`: setuptools vendors
@@ -367,6 +380,21 @@ With `--verify-files`, each conda package whose record lists file hashes carries
 its files checked, and where they apply `pixi:modified-files` and `pixi:missing-files` (comma-separated paths relative
 to the environment) and `pixi:regenerated-bytecode` (how many `.pyc` files Python has rewritten, which is not a
 failure). See [Has anything changed since installation](cli.md#has-anything-changed-since-installation).
+
+
+### npm packages in an environment
+
+With `--prefix`, the JavaScript packages installed in the environment are listed too: every package under its
+`node_modules` trees (`lib/node_modules`, `node_modules` on Windows, and any other a conda package's files are in),
+nested ones included, as `pkg:npm/<name>@<version>` components (`pkg:npm/%40npmcli/arborist@8.0.0` for a scoped
+one). `nodejs` installs npm and npm's own dependencies this way, and a JavaScript tool such as
+`configurable-http-proxy` installs its own under `lib/node_modules/<tool>`. Each is attached to the conda package
+whose files contain it, with `pixi:kind=embedded`, `pixi:embedded-sbom=node_modules:<directory>` (several, separated
+by `;`, when a release is installed in more than one place), and the license, description and homepage its
+`package.json` declares. A dependency points at the copy Node would load: the package's own `node_modules`, then each
+enclosing one outward. A `package.json` inside a package (`esm/`, `dist/`) is a file of that package, a `private`
+one is not a release, and a build-time lockfile is not installed code: none of them is listed. A project's own
+`node_modules`, outside the environment, is not read.
 
 ### Documents derived from documents
 

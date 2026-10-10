@@ -10272,3 +10272,236 @@ fn r_packages_on_cran_get_a_cran_purl_that_osv_answers() {
         .collect();
     assert_eq!(ids, [("RSEC-2023-8", "r-commonmark")]);
 }
+
+/// Go build information as the toolchain writes it since 1.18, in an object file of `format`.
+fn go_binary(format: object::BinaryFormat, go_version: &str, modules: &str) -> Vec<u8> {
+    use object::write::{Object, StandardSegment};
+    use object::{Architecture, Endianness, SectionKind};
+    let varint = |mut n: usize, out: &mut Vec<u8>| {
+        while n >= 0x80 {
+            out.push((n as u8) | 0x80);
+            n >>= 7;
+        }
+        out.push(n as u8);
+    };
+    let mut framed = vec![0x30u8; 16];
+    framed.extend_from_slice(modules.as_bytes());
+    framed.extend_from_slice(&[0x31u8; 16]);
+    let mut data = b"\xff Go buildinf:".to_vec();
+    data.extend_from_slice(&[8, 2]);
+    data.resize(32, 0);
+    varint(go_version.len(), &mut data);
+    data.extend_from_slice(go_version.as_bytes());
+    varint(framed.len(), &mut data);
+    data.extend_from_slice(&framed);
+    let mut object = Object::new(format, Architecture::X86_64, Endianness::Little);
+    let name: &[u8] = match format {
+        object::BinaryFormat::Elf => b".go.buildinfo",
+        object::BinaryFormat::MachO => b"__go_buildinfo",
+        _ => b".data",
+    };
+    let section = object.add_section(
+        object.segment_name(StandardSegment::Data).to_vec(),
+        name.to_vec(),
+        SectionKind::Data,
+    );
+    object.set_section_data(section, data, 16);
+    object.write().unwrap()
+}
+
+/// The modules compiled into Go binaries (#437): components under the
+/// conda package that ships the binary, with the standard library; a binary without build
+/// information is passed over; both formats stay valid.
+#[test]
+fn go_modules_are_read_out_of_an_installed_environment() {
+    let dir = installed_prefix();
+    let prefix = dir.path().join("envs").join("demo");
+    std::fs::create_dir_all(prefix.join("bin")).unwrap();
+    let modules = "path\texample.com/tool\nmod\texample.com/tool\t(devel)\t\n\
+        dep\tgithub.com/spf13/cobra\tv1.8.0\th1:a=\ndep\tgolang.org/x/net\tv0.20.0\th1:b=\n\
+        =>\tgolang.org/x/net\tv0.33.0\th1:c=\nbuild\tGOOS=linux\n";
+    // ELF and Mach-O here; `object` writes COFF objects but not PE executables, so reading the
+    // build information out of a Windows binary's bytes is a unit test of `gobuild::read`.
+    let binaries = [
+        ("bin/tool-elf", object::BinaryFormat::Elf),
+        ("bin/tool-macho", object::BinaryFormat::MachO),
+    ];
+    for (path, format) in binaries {
+        std::fs::write(prefix.join(path), go_binary(format, "go1.27.1", modules)).unwrap();
+    }
+    // An object file with no build information, as a C program in the same package would be.
+    std::fs::write(prefix.join("bin/plain"), audited_binary("not json")).unwrap();
+    let record = prefix.join("conda-meta").join("libzlib-1.3.2-h25fd6f3_3.json");
+    let mut value: Value = serde_json::from_str(&std::fs::read_to_string(&record).unwrap()).unwrap();
+    value["files"] = serde_json::json!(["bin/tool-elf", "bin/tool-macho", "bin/plain", "lib/libz.so.1"]);
+    std::fs::write(&record, value.to_string()).unwrap();
+
+    let run = |args: &[&str]| {
+        pixi_sbom()
+            .current_dir(dir.path())
+            .env("PIXI_CACHE_DIR", dir.path().join("empty-pkgs-cache"))
+            .env("PIXI_SBOM_CACHE_DIR", dir.path().join("sbom-cache"))
+            .env("PIXI_SBOM_OFFLINE", "1")
+            .arg("--prefix")
+            .arg(&prefix)
+            .args(["-p", "linux-64", "--embedded-sboms", "--output", "-"])
+            .args(args)
+            .assert()
+            .success()
+    };
+    let assert = run(&[]).stderr(predicate::str::contains(
+        "read Go build information binaries=2 added=3 merged=3",
+    ));
+    let document: Value = serde_json::from_slice(&assert.get_output().stdout).unwrap();
+    assert_valid(&cyclonedx_validator(), &document);
+    let mut golang: Vec<&str> = document["components"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["purl"].as_str())
+        .filter(|p| p.starts_with("pkg:golang/"))
+        .collect();
+    golang.sort();
+    assert_eq!(
+        golang,
+        [
+            "pkg:golang/github.com/spf13/cobra@v1.8.0",
+            "pkg:golang/golang.org/x/net@v0.33.0",
+            "pkg:golang/stdlib@1.27.1"
+        ],
+        "the replacement wins, and the (devel) main module is the conda package itself"
+    );
+    let zlib = document["components"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "libzlib")
+        .unwrap()["bom-ref"]
+        .clone();
+    let edges = document["dependencies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["ref"] == zlib)
+        .unwrap()["dependsOn"]
+        .clone();
+    assert!(
+        edges
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e == "pkg:golang/stdlib@1.27.1")
+    );
+
+    let spdx: Value = serde_json::from_slice(&run(&["--format", "spdx"]).get_output().stdout).unwrap();
+    assert_valid(&spdx_validator(), &spdx);
+    assert!(
+        spdx["packages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["name"] == "stdlib" && p["versionInfo"] == "go1.27.1")
+    );
+}
+
+/// npm packages installed in an environment (#438): scoped and nested ones are components under
+/// the conda package that installed them, a `package.json` inside a package is not another
+/// package, and both formats stay valid.
+#[test]
+fn npm_packages_installed_in_an_environment_are_listed() {
+    let dir = installed_prefix();
+    let prefix = dir.path().join("envs").join("demo");
+    let write = |path: &str, body: Value| {
+        std::fs::create_dir_all(prefix.join(path)).unwrap();
+        std::fs::write(prefix.join(path).join("package.json"), body.to_string()).unwrap();
+    };
+    write(
+        "lib/node_modules/npm",
+        serde_json::json!({"name": "npm", "version": "10.9.2", "license": "Artistic-2.0",
+        "dependencies": {"@npmcli/arborist": "^8"}}),
+    );
+    write(
+        "lib/node_modules/npm/node_modules/@npmcli/arborist",
+        serde_json::json!({"name": "@npmcli/arborist", "version": "8.0.0",
+        "dependencies": {"semver": "^7"}}),
+    );
+    write(
+        "lib/node_modules/npm/node_modules/semver",
+        serde_json::json!({"name": "semver", "version": "7.6.3", "license": "ISC"}),
+    );
+    write(
+        "lib/node_modules/npm/node_modules/semver/esm",
+        serde_json::json!({"type": "module"}),
+    );
+    let record = prefix.join("conda-meta").join("libzlib-1.3.2-h25fd6f3_3.json");
+    let mut value: Value = serde_json::from_str(&std::fs::read_to_string(&record).unwrap()).unwrap();
+    value["files"] = serde_json::json!([
+        "lib/libz.so.1",
+        "lib/node_modules/npm/package.json",
+        "lib/node_modules/npm/node_modules/@npmcli/arborist/package.json",
+        "lib/node_modules/npm/node_modules/semver/package.json",
+        "lib/node_modules/npm/node_modules/semver/esm/package.json"
+    ]);
+    std::fs::write(&record, value.to_string()).unwrap();
+
+    let run = |args: &[&str]| {
+        pixi_sbom()
+            .current_dir(dir.path())
+            .env("PIXI_CACHE_DIR", dir.path().join("empty-pkgs-cache"))
+            .env("PIXI_SBOM_CACHE_DIR", dir.path().join("sbom-cache"))
+            .env("PIXI_SBOM_OFFLINE", "1")
+            .arg("--prefix")
+            .arg(&prefix)
+            .args(["-p", "linux-64", "--output", "-"])
+            .args(args)
+            .assert()
+            .success()
+    };
+    let assert = run(&[]).stderr(predicate::str::contains(
+        "read the npm packages installed in the environment installed=3 added=3 merged=0 unowned=0",
+    ));
+    let document: Value = serde_json::from_slice(&assert.get_output().stdout).unwrap();
+    assert_valid(&cyclonedx_validator(), &document);
+    let components = document["components"].as_array().unwrap();
+    let mut npm: Vec<&str> = components
+        .iter()
+        .filter_map(|c| c["purl"].as_str())
+        .filter(|p| p.starts_with("pkg:npm/"))
+        .collect();
+    npm.sort();
+    assert_eq!(
+        npm,
+        [
+            "pkg:npm/%40npmcli/arborist@8.0.0",
+            "pkg:npm/npm@10.9.2",
+            "pkg:npm/semver@7.6.3"
+        ]
+    );
+    let zlib = components.iter().find(|c| c["name"] == "libzlib").unwrap()["bom-ref"].clone();
+    let depends_on = |reference: &Value| -> Vec<String> {
+        document["dependencies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| &e["ref"] == reference)
+            .map(|e| {
+                e["dependsOn"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|d| d.as_str().unwrap().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    assert!(depends_on(&zlib).contains(&"pkg:npm/npm@10.9.2".to_string()));
+    assert_eq!(
+        depends_on(&Value::from("pkg:npm/%40npmcli/arborist@8.0.0")),
+        ["pkg:npm/semver@7.6.3"]
+    );
+    let semver = components.iter().find(|c| c["purl"] == "pkg:npm/semver@7.6.3").unwrap();
+    assert_eq!(semver["licenses"][0]["expression"], "ISC", "from its package.json");
+
+    let spdx: Value = serde_json::from_slice(&run(&["--format", "spdx"]).get_output().stdout).unwrap();
+    assert_valid(&spdx_validator(), &spdx);
+}

@@ -59,6 +59,8 @@ pub mod format;
 #[doc(hidden)]
 pub mod fromsbom;
 #[doc(hidden)]
+pub mod gobuild;
+#[doc(hidden)]
 pub mod http;
 #[doc(hidden)]
 pub mod imports;
@@ -76,6 +78,8 @@ pub mod merge;
 pub mod mirror;
 #[doc(hidden)]
 pub mod model;
+#[doc(hidden)]
+pub mod npm;
 #[doc(hidden)]
 pub mod osv;
 #[doc(hidden)]

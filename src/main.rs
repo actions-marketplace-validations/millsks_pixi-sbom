@@ -6,9 +6,9 @@
 
 use pixi_sbom::{
     auditable, batch, cache, cli, concurrency, condaarchive, condalock, config, cran, diff, discover, doctor, embedded,
-    epss, explain, explicit, filter, format, fromsbom, http, imports, kev, license, lock, manifest, mapping, merge,
-    mirror, model, osv, outdated, pdm, phantom, pkgcache, poetry, policy, prefix, progress, pylock, pypi, report,
-    requirements, scorecard, style, timings, uv, verify, vexin, vulnpolicy, wheel,
+    epss, explain, explicit, filter, format, fromsbom, gobuild, http, imports, kev, license, lock, manifest, mapping,
+    merge, mirror, model, npm, osv, outdated, pdm, phantom, pkgcache, poetry, policy, prefix, progress, pylock, pypi,
+    report, requirements, scorecard, style, timings, uv, verify, vexin, vulnpolicy, wheel,
 };
 
 /// The system allocator on macOS and Windows is slow under the many small allocations a
@@ -489,6 +489,23 @@ fn main() -> Result<()> {
             from_rule,
             not_cran,
         } = cran::identify(&mut sbom, prefix_dir, &pkgcache::package_cache_dir());
+        if let Some(dir) = prefix_dir {
+            let npm::Outcome {
+                installed,
+                added,
+                merged,
+                unowned,
+            } = npm::attach(&mut sbom, dir);
+            if installed > 0 {
+                tracing::info!(
+                    installed,
+                    added,
+                    merged,
+                    unowned,
+                    "read the npm packages installed in the environment"
+                );
+            }
+        }
         if from_description + from_table + from_rule + not_cran > 0 {
             tracing::info!(
                 from_description,
@@ -2405,6 +2422,13 @@ fn enrich(sbom: &mut model::Sbom, args: &cli::Args, input: &Input, progress: pro
                     merged,
                 } = auditable::enrich(sbom, dir, progress);
                 tracing::info!(binaries, added, merged, "read cargo auditable crate lists");
+                // Go binaries carry their module list the same way, as build information.
+                let gobuild::Outcome {
+                    binaries,
+                    added,
+                    merged,
+                } = gobuild::enrich(sbom, dir, progress);
+                tracing::info!(binaries, added, merged, "read Go build information");
                 // Python distributions a package ships inside itself (setuptools/_vendor).
                 let prefix::VendoredOutcome { added, merged } = prefix::attach_vendored(sbom, dir);
                 tracing::info!(added, merged, "attached vendored Python distributions");
