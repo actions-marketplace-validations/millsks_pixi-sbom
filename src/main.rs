@@ -238,6 +238,17 @@ fn main() -> Result<()> {
 
     let spec_version = resolve_spec_version(&args);
     let fetch_licenses = args.fetch_licenses || args.pypi_licenses;
+    if args.format == cli::Format::Github
+        && args.report.is_none()
+        && ["GITHUB_SHA", "GITHUB_REF"]
+            .iter()
+            .any(|name| std::env::var(name).is_err())
+    {
+        tracing::warn!(
+            "GITHUB_SHA or GITHUB_REF is not set, so the snapshot names no commit and GitHub's submission API \
+             will refuse it; GitHub Actions sets both, elsewhere set them to the commit and ref it describes"
+        );
+    }
     if args.pypi_licenses {
         tracing::warn!("--pypi-licenses is deprecated and now behaves as --fetch-licenses; use that instead");
     }
@@ -1242,6 +1253,12 @@ fn validate(args: &cli::Args) {
                 "'--vex' needs '--vulnerabilities <SOURCE>': there is nothing to assess without findings",
             );
         }
+        if args.format == cli::Format::Github {
+            usage(
+                ArgumentConflict,
+                "'--vex' writes a CycloneDX VEX linked to a CycloneDX SBOM and cannot be combined with '--format github'",
+            );
+        }
         if args.format == cli::Format::Spdx {
             usage(
                 ArgumentConflict,
@@ -1475,10 +1492,16 @@ const FEATURES: &str = "rustls, gzip, platform-verifier, socks-proxy, win-system
 
 /// Scanners read only a package's primary purl, so with the default `--primary-purl conda` a conda
 /// package's PyPI identity is invisible to them and its advisories go unreported (#449). Said once
-/// a run, and not at all once the setting is chosen, `conda` included.
+/// a run, and not at all once the setting is chosen, `conda` included. A report or an explanation
+/// goes to no scanner, and a GitHub snapshot submits the PyPI identity anyway, so neither warns.
 fn warn_unscannable_pypi(sbom: &model::Sbom, args: &cli::Args) {
     static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if args.primary_purl_chosen || args.primary_purl != cli::PrimaryPurl::Conda {
+    if args.primary_purl_chosen
+        || args.primary_purl != cli::PrimaryPurl::Conda
+        || args.report.is_some()
+        || !args.explain.is_empty()
+        || args.format == cli::Format::Github
+    {
         return;
     }
     let hidden = mapping::hidden_pypi_identities(sbom);
