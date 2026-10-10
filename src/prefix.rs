@@ -314,7 +314,8 @@ fn found(prefix: &Path) -> String {
 }
 
 /// The Python version an environment without conda records was made with: `version` or
-/// `version_info` in `pyvenv.cfg`, else the `pythonX.Y` of its site-packages path.
+/// `version_info` in `pyvenv.cfg`, else the `pythonX.Y` of its site-packages path, made `X.Y.Z`
+/// by `include/pythonX.Y/patchlevel.h` where the installation ships its headers.
 fn interpreter(prefix: &Path) -> Option<String> {
     let config = std::fs::read_to_string(prefix.join("pyvenv.cfg")).unwrap_or_default();
     let from_config = config.lines().find_map(|line| {
@@ -325,16 +326,48 @@ fn interpreter(prefix: &Path) -> Option<String> {
         })
     });
     from_config.filter(|v| !v.is_empty()).or_else(|| {
-        let mut versions: Vec<String> = std::fs::read_dir(prefix.join("lib"))
+        // conda-forge's `python3.1 -> python3.11` is not a version; and 3.12 is newer than 3.9.
+        let mut versions: Vec<(Vec<u32>, String)> = std::fs::read_dir(prefix.join("lib"))
             .into_iter()
             .flatten()
             .flatten()
-            .filter(|e| e.path().join("site-packages").is_dir())
-            .filter_map(|e| e.file_name().to_str()?.strip_prefix("python").map(str::to_string))
+            .filter(|e| !e.path().is_symlink() && e.path().join("site-packages").is_dir())
+            .filter_map(|e| {
+                let version = e.file_name().to_str()?.strip_prefix("python")?.to_string();
+                let key = version
+                    .split('.')
+                    .map(|part| part.parse().ok())
+                    .collect::<Option<Vec<u32>>>()?;
+                Some((key, version))
+            })
             .collect();
         versions.sort();
-        versions.pop()
+        let (_, short) = versions.pop()?;
+        Some(patchlevel(prefix, &short).unwrap_or(short))
     })
+}
+
+/// `PY_VERSION` from `include/pythonX.Y/patchlevel.h`: the full version of an installation built
+/// from source, such as the official container images' `/usr/local`.
+fn patchlevel(prefix: &Path, short: &str) -> Option<String> {
+    let header = std::fs::read_to_string(
+        prefix
+            .join("include")
+            .join(format!("python{short}"))
+            .join("patchlevel.h"),
+    )
+    .ok()?;
+    let version = header.lines().find_map(|line| {
+        let rest = line
+            .trim()
+            .strip_prefix("#define")?
+            .trim()
+            .strip_prefix("PY_VERSION")?
+            .trim();
+        Some(rest.trim_matches('"').trim().to_string())
+    })?;
+    // `3.12.15`, or `3.13.0rc2` for a candidate: kept only when it is this installation's X.Y.
+    version.starts_with(&format!("{short}.")).then_some(version)
 }
 
 /// The conda platform a wheel's platform tag was built for, when it names one.
@@ -351,6 +384,55 @@ fn tag_platform(tag: &str) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// The conda platform a compiled file was built for, from its format and architecture. A universal
+/// (fat) Mach-O file names more than one, so it names none.
+fn object_platform(bytes: &[u8]) -> Option<&'static str> {
+    use object::{Architecture, BinaryFormat, Object};
+    let file = object::File::parse(bytes).ok()?;
+    Some(match (file.format(), file.architecture()) {
+        (BinaryFormat::Elf, Architecture::X86_64) => "linux-64",
+        (BinaryFormat::Elf, Architecture::Aarch64) => "linux-aarch64",
+        (BinaryFormat::Elf, Architecture::PowerPc64) if file.is_little_endian() => "linux-ppc64le",
+        (BinaryFormat::MachO, Architecture::X86_64) => "osx-64",
+        (BinaryFormat::MachO, Architecture::Aarch64) => "osx-arm64",
+        (BinaryFormat::Pe, Architecture::X86_64) => "win-64",
+        (BinaryFormat::Pe, Architecture::Aarch64) => "win-arm64",
+        _ => return None,
+    })
+}
+
+/// The platform the interpreter, or the standard library's compiled modules, were built for: what
+/// a Python installation scanned from another machine (a container's root filesystem) is for,
+/// rather than the machine doing the scanning.
+fn binary_platform(prefix: &Path) -> Option<String> {
+    let entries = |dir: PathBuf, keep: &dyn Fn(&Path) -> bool| -> Vec<PathBuf> {
+        let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| keep(p))
+            .collect();
+        found.sort();
+        found
+    };
+    let named = |p: &Path, test: &dyn Fn(&str) -> bool| p.file_name().is_some_and(|n| test(&n.to_string_lossy()));
+    let mut candidates = vec![prefix.join("python.exe")];
+    candidates.extend(entries(prefix.join("bin"), &|p| named(p, &|n| n.starts_with("python"))));
+    candidates.extend(entries(prefix.join("DLLs"), &|p| named(p, &|n| n.ends_with(".pyd"))));
+    for lib in entries(prefix.join("lib"), &|p| named(p, &|n| n.starts_with("python"))) {
+        let modules = entries(lib.join("lib-dynload"), &|p| named(p, &|n| n.ends_with(".so")));
+        candidates.extend(modules.into_iter().take(8));
+    }
+    candidates.iter().find_map(|path| {
+        // A real interpreter is small (it links libpython); anything huge is not worth reading.
+        if std::fs::metadata(path).ok()?.len() > 64 << 20 {
+            return None;
+        }
+        object_platform(&std::fs::read(path).ok()?).map(str::to_string)
+    })
 }
 
 /// The platform the installed wheels were built for, by majority of their `WHEEL` tags.
@@ -438,6 +520,7 @@ pub fn build_sbom(prefix: &Path, root: Root, platform: Option<&str>) -> Result<S
                 .max_by_key(|(_, count)| *count)
                 .map(|(subdir, _)| subdir)
         })
+        .or_else(|| binary_platform(prefix))
         .or_else(|| wheel_platform(&dist_infos))
         .or_else(|| {
             prefix
@@ -590,18 +673,25 @@ pub fn dist_infos(prefix: &Path) -> Vec<PathBuf> {
 }
 
 /// The site-packages directories an environment may have, whichever layout the platform uses:
-/// `Lib/site-packages` on Windows, `lib/python3.X/site-packages` elsewhere.
+/// `Lib/site-packages` on Windows, `lib/python3.X/site-packages` elsewhere. Each directory once:
+/// conda-forge's Python ships `lib/python3.1 -> python3.11`, and reading through both would list
+/// every pip-installed package twice. The real path is kept over a symlink to it.
 fn site_packages(prefix: &Path) -> Vec<PathBuf> {
-    let mut roots = vec![prefix.join("Lib").join("site-packages")];
+    let mut candidates = vec![prefix.join("Lib").join("site-packages")];
     if let Ok(lib) = std::fs::read_dir(prefix.join("lib")) {
-        for entry in lib.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with("python") {
-                roots.push(entry.path().join("site-packages"));
-            }
-        }
+        let mut pythons: Vec<_> = lib
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("python"))
+            .map(|entry| (entry.path().is_symlink(), entry.path()))
+            .collect();
+        pythons.sort();
+        candidates.extend(pythons.into_iter().map(|(_, dir)| dir.join("site-packages")));
     }
-    roots
+    let mut seen = std::collections::HashSet::new();
+    candidates
+        .into_iter()
+        .filter(|root| root.canonicalize().map_or(true, |real| seen.insert(real)))
+        .collect()
 }
 
 /// A pip-installed package from its `dist-info`; `None` when the metadata is unusable, or when
@@ -812,6 +902,79 @@ mod tests {
         );
     }
 
+    fn compiled(format: object::BinaryFormat, architecture: object::Architecture) -> Vec<u8> {
+        object::write::Object::new(format, architecture, object::Endianness::Little)
+            .write()
+            .unwrap()
+    }
+
+    #[test]
+    fn compiled_files_name_the_platform_they_were_built_for() {
+        use object::{Architecture, BinaryFormat};
+        assert_eq!(
+            object_platform(&compiled(BinaryFormat::Elf, Architecture::X86_64)),
+            Some("linux-64")
+        );
+        assert_eq!(
+            object_platform(&compiled(BinaryFormat::Elf, Architecture::Aarch64)),
+            Some("linux-aarch64")
+        );
+        assert_eq!(
+            object_platform(&compiled(BinaryFormat::MachO, Architecture::Aarch64)),
+            Some("osx-arm64")
+        );
+        assert_eq!(
+            object_platform(&compiled(BinaryFormat::MachO, Architecture::X86_64)),
+            Some("osx-64")
+        );
+        assert_eq!(object_platform(b"#!/bin/sh\n"), None);
+    }
+
+    /// A Linux arm64 container's `/usr/local`, scanned from any machine: the platform is the
+    /// interpreter's, not the scanner's, and the version is the full one its headers state.
+    #[test]
+    fn a_python_installation_is_described_for_its_own_platform_and_full_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path();
+        std::fs::create_dir_all(local.join("bin")).unwrap();
+        std::fs::write(
+            local.join("bin/python3.12"),
+            compiled(object::BinaryFormat::Elf, object::Architecture::Aarch64),
+        )
+        .unwrap();
+        let pip = local.join("lib/python3.12/site-packages/pip-25.0.1.dist-info");
+        std::fs::create_dir_all(&pip).unwrap();
+        std::fs::write(
+            pip.join("METADATA"),
+            "Metadata-Version: 2.1\nName: pip\nVersion: 25.0.1\n",
+        )
+        .unwrap();
+        std::fs::write(pip.join("WHEEL"), "Wheel-Version: 1.0\nTag: py3-none-any\n").unwrap();
+        std::fs::create_dir_all(local.join("lib/python3.9/site-packages")).unwrap();
+        std::fs::create_dir_all(local.join("include/python3.12")).unwrap();
+        std::fs::write(
+            local.join("include/python3.12/patchlevel.h"),
+            "#define PY_MINOR_VERSION 12\n#define PY_VERSION \"3.12.15\"\n",
+        )
+        .unwrap();
+
+        let sbom = build_sbom(local, Root::default(), None).unwrap();
+        assert_eq!(sbom.platform, "linux-aarch64", "from bin/python3.12, not this machine");
+        assert_eq!(
+            sbom.interpreter.as_deref(),
+            Some("3.12.15"),
+            "3.12 over 3.9, then patchlevel.h"
+        );
+
+        std::fs::remove_file(local.join("include/python3.12/patchlevel.h")).unwrap();
+        let sbom = build_sbom(local, Root::default(), None).unwrap();
+        assert_eq!(
+            sbom.interpreter.as_deref(),
+            Some("3.12"),
+            "without headers, the directory's X.Y"
+        );
+    }
+
     #[test]
     fn platform_override_and_errors() {
         let sbom = build_sbom(&fixture(), Root::default(), Some("osx-arm64")).unwrap();
@@ -831,6 +994,23 @@ mod tests {
 
     fn fixtures(name: &str) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name)
+    }
+
+    /// conda-forge's Python ships `lib/python3.1 -> python3.11`; site-packages is read once,
+    /// through the real directory.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_python_directory_is_read_once_through_the_real_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("lib/python3.11/site-packages/six-1.17.0.dist-info");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink("python3.11", dir.path().join("lib/python3.1")).unwrap();
+        let roots: Vec<_> = site_packages(dir.path())
+            .into_iter()
+            .filter(|root| root.is_dir())
+            .collect();
+        assert_eq!(roots, [dir.path().join("lib/python3.11/site-packages")]);
+        assert_eq!(dist_infos(dir.path()), [real]);
     }
 
     #[test]
